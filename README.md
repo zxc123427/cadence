@@ -15,7 +15,8 @@ python3 chat.py                                    # 对话（需要 API KEY）
 
 python3 log_meal.py 牛肉面 --note 有点咸            # 记一顿饭
 python3 log_meal.py 麻辣烫 --at 12:30
-python3 meals.py --days 7                          # 看最近吃了什么
+python3 meals.py --days 7                          # 看最近吃了什么（带 id）
+python3 meals.py --delete 3                        # 删一条（只有你能删，模型不能）
 
 python3 remember.py --list                         # 当前有效的记忆
 python3 remember.py preference food.dislike.cilantro "不吃香菜"
@@ -31,6 +32,7 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 |---|---|
 | `db.py` | **所有读写的唯一入口**。没有 `execute_sql()`，只有具体函数（文档 5.7） |
 | `llm.py` | system prompt、工具定义、工具调用循环 |
+| `ui.py` | **跟人确认的唯一入口**。换语音时只改这一个文件 |
 | `config.py` / `.env` | 模型配置。换厂商只改 `.env` |
 | `chat.py` | 对话入口 |
 | `log_meal.py` / `meals.py` / `remember.py` | 独立 CLI 脚本（文档 8.2） |
@@ -44,6 +46,8 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 - **记忆追加不覆盖**，所以 `--history` 查得到"它为什么这么以为"（5.4）
 - **`memories.key` 用归一化英文**（`food.dislike.cilantro`），人话放 `value`（5.4）
 - **模型只能调窄接口**，不能自己写 SQL（5.7）
+- **模型能改不能删。** 删除不可逆、更正可逆，风险差一档，所以删除权留在 CLI 里（5.7）
+- **确认只能走 `ui.confirm()`，别在别处写 `input()`。** 写在 system prompt 里的"请先确认"不算数——模型可能不听，而且你查不出为什么（6.1）
 - **查不到就说查不到，不编**（7.4）
 - 每次模型调用的 token 数写进 `events` 表 —— 没有账本就没有优化（12.1）
 

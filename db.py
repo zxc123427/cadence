@@ -108,12 +108,61 @@ def log_meal(name: str, note: str | None = None, ts: str | None = None) -> int:
     return cur.lastrowid
 
 
+def correct_log(row_id: int, name: str | None = None, note: str | None = None) -> bool:
+    """更正一条记录。id 不存在时返回 False。
+
+    logs 用真改、不留旧版本：memories 追加不覆盖是因为"我曾经这么以为"
+    本身有价值；而 logs 里一条抽错的记录不是历史，它从来就不是真的。
+    留痕交给 events —— 旧值进流水账，事后能查出改过什么。
+    """
+    with connect() as conn:
+        old = conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
+        if old is None:
+            return False
+        new_name = name if name is not None else old["name"]
+        new_note = note if note is not None else old["note"]
+        conn.execute("UPDATE logs SET name = ?, note = ? WHERE id = ?",
+                     (new_name, new_note, row_id))
+
+    record_event("cli", "correct_log", {
+        "id": row_id,
+        "old": {"name": old["name"], "note": old["note"]},
+        "new": {"name": new_name, "note": new_note},
+    })
+    return True
+
+
+def delete_log(row_id: int) -> sqlite3.Row | None:
+    """删掉一条记录，返回被删的内容；id 不存在返回 None。
+
+    ⚠️ 这个函数不给模型用，只给 CLI（见 llm.py 的 TOOLS）。
+    删除不可逆、更正可逆，风险差一档，所以这个权限留在人手里。
+
+    被删内容会进 events，所以真删错了还能从流水账里读回来重插。
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM logs WHERE id = ?", (row_id,))
+
+    record_event("cli", "delete_log", {
+        "id": row_id, "kind": row["kind"], "name": row["name"],
+        "note": row["note"], "ts": row["ts"],
+    })
+    return row
+
+
 def remember(category: str, key: str, value: str,
              source: str = "manual", expires_at: str | None = None) -> int:
     """记一条偏好/约束/事实。
 
     同一个 key 再写一次不会覆盖旧的，而是追加新版本 —— 读取时自然取到最新的。
     这样"它为什么以为我爱吃日料"永远查得出来。
+
+    ⚠️ 所以记忆不需要 undo / delete，别再加。记错了就再 remember 一次：
+    新版本自动生效，错的那条留着当历史。追加不覆盖的设计已经把"改"
+    这件事解决了（设计文档 5.4）。
     """
     with connect() as conn:
         cur = conn.execute(
@@ -126,12 +175,40 @@ def remember(category: str, key: str, value: str,
 
 # ---------- 窄接口：读 ----------
 
-def recent_meals(days: int = 7) -> list[sqlite3.Row]:
+def find_logs(kind: str | None = None, name: str | None = None,
+              days: int = 30) -> list[sqlite3.Row]:
+    """按条件找记录。返回的行带 id —— 更正和删除都要靠 id 定位。
+
+    为什么不直接按名字改删：名字会重复。"牛肉面"你可能吃过三次，
+    按名字动手会一次改掉三条。所以 kind / name / 时间只负责「找到」，
+    真正动手的依据永远是 id。
+    """
+    # 注意：这里的 f-string 只拼固定的条件片段，所有「值」仍然走 ? 参数。
+    # 千万别把 name 之类的内容直接拼进 SQL 字符串里。
+    where = ["ts >= ?"]
+    params: list = [days_ago(days)]
+    if kind:
+        where.append("kind = ?")
+        params.append(kind)
+    if name:
+        where.append("name LIKE ?")
+        params.append(f"%{name}%")
+
     with connect() as conn:
         return conn.execute(
-            "SELECT * FROM logs WHERE kind = 'meal' AND ts >= ? ORDER BY ts DESC",
-            (days_ago(days),),
+            f"SELECT * FROM logs WHERE {' AND '.join(where)} ORDER BY ts DESC",
+            params,
         ).fetchall()
+
+
+def recent_meals(days: int = 7) -> list[sqlite3.Row]:
+    """find_logs 的薄封装，meals.py 在用。"""
+    return find_logs(kind="meal", days=days)
+
+
+def get_log(row_id: int) -> sqlite3.Row | None:
+    with connect() as conn:
+        return conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
 
 
 def active_memories() -> list[sqlite3.Row]:

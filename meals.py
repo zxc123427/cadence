@@ -9,12 +9,34 @@ import argparse
 from collections import Counter
 
 import db
+import ui
+
+
+def do_delete(row_id: int) -> None:
+    """删除入口只在这里 —— 模型没有这个工具，只有你自己能删。
+
+    删除不可逆而更正可逆，所以这个权限留在人手里（设计文档 5.7）。
+    """
+    row = db.get_log(row_id)
+    if row is None:
+        print(f"没有 id={row_id} 这条记录。")
+        return
+    detail = f"{db.to_local(row['ts'])}  {row['name']}" + (f"（{row['note']}）" if row["note"] else "")
+    if not ui.confirm("确定删除这条吗？", detail, indent=""):
+        print("没删。")
+        return
+    db.delete_log(row_id)
+    print(f"已删除 id={row_id}（内容已记进 events，真删错了还能查回来）")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="查看最近的饮食记录")
     p.add_argument("--days", type=int, default=7, help="往前看几天，默认 7")
+    p.add_argument("--delete", type=int, metavar="ID", help="删除指定 id 的记录")
     args = p.parse_args()
+
+    if args.delete is not None:
+        return do_delete(args.delete)
 
     rows = db.recent_meals(args.days)
     if not rows:
@@ -23,7 +45,8 @@ def main() -> None:
 
     print(f"最近 {args.days} 天，{len(rows)} 条记录：\n")
     for r in rows:
-        line = f"  {db.to_local(r['ts'])}  {r['name']}"
+        # 带上 id：删除和更正都要靠它定位
+        line = f"  [{r['id']:>3}]  {db.to_local(r['ts'])}  {r['name']}"
         if r["note"]:
             line += f"  （{r['note']}）"
         print(line)

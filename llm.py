@@ -19,6 +19,7 @@ from openai import OpenAI
 
 import config
 import db
+import ui
 
 # 一次对话里最多跑几轮工具调用。防的不是逻辑错误，是"模型和工具互相刷屏
 # 停不下来"——设计文档 12.1：熔断的意义在于让"忘了关"不再有灾难后果。
@@ -40,6 +41,11 @@ def _client() -> OpenAI:
     return _client_cache
 
 
+def _fmt_log(r) -> str:
+    return (f"id={r['id']}  {db.to_local(r['ts'])}  {r['kind']}  {r['name']}"
+            + (f"（{r['note']}）" if r["note"] else ""))
+
+
 # ---------- 给模型的工具（全是 db.py 里的窄接口） ----------
 
 TOOLS = [
@@ -47,12 +53,23 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "log_meal",
-            "description": "记录用户吃了什么。用户提到自己吃了/在吃某样东西时调用。",
+            "description": (
+                "记录用户吃了什么。用户提到自己吃了/在吃某样东西时调用。"
+                "一句话里提到多样食物，就每样调用一次，不要合并成一条。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "食物名称，如 牛肉面"},
-                    "note": {"type": "string", "description": "用户对这顿饭的评价，如 有点咸。没有就不填"},
+                    # 这里刻意不给具体食物做示例：示例词会在上下文里被反复
+                    # 强化，模型后面容易把它当默认值填进来。
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "食物名称。只能取用户最新这一句话里明确提到的食物，"
+                            "绝不要沿用上一轮的名字。这一句里没有出现食物名称就不要调用本工具。"
+                        ),
+                    },
+                    "note": {"type": "string", "description": "用户对它的评价或补充。没有就不填"},
                 },
                 "required": ["name"],
             },
@@ -61,13 +78,38 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "recent_meals",
-            "description": "查用户最近吃了什么。回答'我最近吃了啥''推荐吃什么'时先调这个。",
+            "name": "find_logs",
+            "description": (
+                "查记录。回答'我最近吃了啥''推荐吃什么'时先调这个。"
+                "要更正某条记录之前也必须先调它拿到 id。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "往前看几天，默认 7"},
+                    "kind": {"type": "string", "description": "记录类型，饮食填 meal。不填就查全部"},
+                    "name": {"type": "string", "description": "按名称模糊匹配。不填就不按名称筛"},
+                    "days": {"type": "integer", "description": "往前看几天，默认 30"},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "correct_log",
+            "description": (
+                "更正一条已有记录的名称或备注。**必须先用 find_logs 查到 id**，"
+                "不要凭印象猜 id。执行前系统会向用户当面确认，用户拒绝就作罢。"
+                "没有删除记录的工具，用户要删就如实告诉他你做不到。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "要改的记录 id，来自 find_logs 的结果"},
+                    "name": {"type": "string", "description": "改成的新名称。不改就不填"},
+                    "note": {"type": "string", "description": "改成的新备注。不改就不填"},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -102,14 +144,33 @@ def _run_tool(name: str, args: dict) -> str:
         db.log_meal(args["name"], note=args.get("note"))
         return f"已记录：{args['name']}"
 
-    if name == "recent_meals":
-        rows = db.recent_meals(args.get("days", 7))
+    if name == "find_logs":
+        rows = db.find_logs(kind=args.get("kind"), name=args.get("name"),
+                            days=args.get("days", 30))
         if not rows:
-            return "最近没有饮食记录。"
-        return "\n".join(
-            f"{db.to_local(r['ts'])} {r['name']}" + (f"（{r['note']}）" if r["note"] else "")
-            for r in rows
-        )
+            return "没找到符合条件的记录。"
+        return "\n".join(_fmt_log(r) for r in rows)
+
+    if name == "correct_log":
+        row_id = args["id"]
+        old = db.get_log(row_id)
+        if old is None:
+            return f"没有 id={row_id} 这条记录，先用 find_logs 确认 id。"
+
+        changes = []
+        if args.get("name"):
+            changes.append(f"名称改成「{args['name']}」")
+        if args.get("note"):
+            changes.append(f"备注改成「{args['note']}」")
+        if not changes:
+            return "没说要改什么，name 和 note 至少给一个。"
+
+        if not ui.confirm(f"要把这条{'，'.join(changes)}吗？", _fmt_log(old)):
+            # 把拒绝如实告诉模型，让它知道这次没生效，别接着往下假设。
+            return "用户拒绝了这次改动，记录没有变。"
+
+        db.correct_log(row_id, name=args.get("name"), note=args.get("note"))
+        return f"已更正 id={row_id}"
 
     if name == "remember":
         db.remember(args["category"], args["key"], args["value"], source="voice")
@@ -124,6 +185,7 @@ def system_prompt() -> str:
     lines = [
         "你是 cadence，一个只服务于一个人的私人助手。说话简短、直接，不用客服腔，不要每句都确认。",
         "用户提到吃了什么就调 log_meal 记下来，不用问他要不要记。",
+        "用户说之前哪条记错了，先用 find_logs 查出来复述给他，确认是哪一条之后再用 correct_log。",
         "查不到的信息就说没查到，绝不编。编一家不存在的餐厅比不回答糟糕得多。",
     ]
 
