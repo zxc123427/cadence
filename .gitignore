@@ -1,0 +1,13 @@
+# API key 在里面。一旦提交进去，就算之后删掉也永远留在 git 历史里。
+.env
+
+# 私人数据，不进版本控制
+cadence.db
+
+# Python 的编译缓存
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vscode/
+.DS_Store
