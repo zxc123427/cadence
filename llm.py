@@ -21,7 +21,6 @@ from openai import OpenAI
 import amap
 import config
 import db
-import places
 import ui
 
 # 一次对话里最多跑几轮工具调用。防的不是逻辑错误，是"模型和工具互相刷屏
@@ -67,14 +66,17 @@ def _resolve_center(near: str | None) -> tuple[str, str]:
     """定这次查询的中心点，返回 (坐标, 给人看的名字)。
 
     优先级：这次说了 > 上次用过的 > .env 里的家。
+    地名解析走 amap.resolve()，跟 places.py 是同一个函数。
     """
     global _last_center
     if near:
-        _last_center = places.resolve(near, quiet=True)
+        hit = amap.resolve(near)
+        _last_center = (hit["location"], hit["label"])
     elif _last_center is None:
         if not config.HOME:
-            raise ValueError("没有默认地点。要么在问题里说个地方，"
-                             "要么在 .env 里加一行 CADENCE_HOME=经度,纬度")
+            raise amap.GeocodeError(
+                "没有默认地点。要么在问题里说个地方，"
+                "要么在 .env 里加一行 CADENCE_HOME=经度,纬度")
         _last_center = (config.HOME, "家")
     return _last_center
 
@@ -401,8 +403,16 @@ def _run_place_tool(name: str, args: dict) -> str:
     """find_places / list_place_types。两个都要先定中心点，所以放在一起。"""
     try:
         center, label = _resolve_center(args.get("near"))
-    except (ValueError, SystemExit) as e:
-        return f"定位不了这个地方：{e}。让用户说得具体一点。"
+    except amap.GeocodeError as e:
+        # 定位不了不是程序坏了，是用户说的地方太含糊。
+        # 把原话转给模型让它去问，比抛异常打断整场对话强。
+        return f"{e} 让用户说得具体一点，别自己猜一个地方查。"
+    except (amap.AmapError, OSError) as e:
+        # 地址整个解析不出来时高德会直接报错（实测编一个不存在的路名会
+        # 返回 30001）。这一步也必须接住 —— 工具抛异常会打断整场对话，
+        # 而这只是"这个地名查不了"，说一声就行。
+        return (f"定位「{args.get('near')}」失败：{e}。"
+                f"告诉用户这个地名查不到，让他换个说法，不要编一个地方。")
 
     radius = args.get("radius") or 3000
 

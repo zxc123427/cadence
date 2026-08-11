@@ -41,6 +41,14 @@ class AmapError(Exception):
     """高德返回了失败状态。消息里带上它自己的说明，别自己编。"""
 
 
+class GeocodeError(Exception):
+    """一个地名解析不出能用的坐标。消息就是给人看的那句话。
+
+    单独一个异常类型，是为了跟 AmapError 分开：AmapError 是"接口出问题了"，
+    这个是"你说的这个地方我定位不了"，两者该说的话完全不同。
+    """
+
+
 # 并发/QPS 类的错误码。这类是"你太快了"，等一下重试就好，
 # 跟"key 不对""额度用完了"完全不同 —— 后者重试多少次都没用。
 # 实测触发点：翻页拉全量时连着发二十多个请求，第二个关键词就被拦。
@@ -117,6 +125,73 @@ def geocode(address: str, city: str = "") -> list[dict]:
         }
         for g in data.get("geocodes", [])
     ]
+
+
+def looks_like_coords(s: str) -> bool:
+    """"121.47,31.23" 这种算坐标，其余一律当地址去查。"""
+    parts = s.split(",")
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0]), float(parts[1])
+    except ValueError:
+        return False
+    return True
+
+
+# 匹配得太粗，说明高德没找着你写的地方，只好给了个行政中心。
+# 这种坐标拿去查周边毫无意义 —— 宁可报错，也不能静悄悄地返回一个错的。
+#
+# ⚠️ 这些字符串必须跟高德实际返回的 level 一字不差。之前写成"城市"，
+# 而高德给的是"市"，于是这道拦截从写出来就是死的：查"南京"会拿市中心
+# 跑 3 公里，一条错也不报。**照着真实响应写，别照着自己的直觉写。**
+# 区县及更细的（区县 / 商圈 / 道路 / 兴趣点 / 门牌号）都放行。
+_TOO_COARSE = ("国家", "省", "市")
+
+
+def resolve(place: str, city: str | None = None) -> dict:
+    """地名或坐标 -> {location, label, formatted_address, level, alternatives}。
+
+    这是所有"用户说了个地方"的统一入口：CLI 和模型工具都走它，谁也别自己
+    拼 geocode 调用。解析不了就抛 GeocodeError，**由调用方决定是打印退出
+    还是回一句话给模型** —— 所以这里不 print、不 exit。
+
+    city 不传就自动用家所在的市。地名重名是常态（新街口 / 中山路 / 人民广场
+    哪个城市都有），不限范围的话高德会给你另一个省的同名地点，还不报错。
+    传空字符串表示明确不限制。
+
+    label 里带上高德解析出的完整地址：光显示"新街口"，你没法判断它去的是
+    哪个新街口。这一路要显示到底，包括返回给模型的那一行。
+    """
+    place = (place or "").strip()
+    if not place:
+        raise GeocodeError("没说地方。")
+    if looks_like_coords(place):
+        return {"location": place, "label": place, "formatted_address": place,
+                "level": "坐标", "alternatives": 0}
+
+    if city is None:
+        city = city_of(config.HOME) if config.HOME else ""
+
+    hits = geocode(place, city=city)
+    if not hits:
+        where = f"在{city}" if city else ""
+        raise GeocodeError(f"高德{where}找不到「{place}」。"
+                           f"写详细点试试，比如带上区和路名。")
+
+    best = hits[0]
+    if best["level"] in _TOO_COARSE:
+        raise GeocodeError(
+            f"「{place}」只匹配到{best['level']}一级（{best['formatted_address']}），"
+            f"太粗了，查周边没意义。地址写细一点，带上区和路名门牌号。")
+
+    return {
+        "location": best["location"],
+        "label": f"{place}（{best['formatted_address']}）",
+        "formatted_address": best["formatted_address"],
+        "level": best["level"],
+        "alternatives": len(hits) - 1,
+    }
 
 
 # 高德一页最多 25 条，要更多就得翻页。

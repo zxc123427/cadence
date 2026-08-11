@@ -28,55 +28,27 @@ COORD_HINT = """坐标怎么来（两条路，随便哪条）：
 ⚠️ 一定从高德取。别的地图坐标系不一样，直接抄过来差几百米。"""
 
 
-def looks_like_coords(s: str) -> bool:
-    """"121.47,31.23" 这种算坐标，其余一律当地址去查。"""
-    parts = s.split(",")
-    if len(parts) != 2:
-        return False
-    try:
-        float(parts[0]), float(parts[1])
-    except ValueError:
-        return False
-    return True
+def resolve(place: str) -> dict:
+    """amap.resolve 的 CLI 外壳：解析不了就打印一句话退出。
 
-
-def resolve(place: str, quiet: bool = False) -> tuple[str, str]:
-    """把用户给的东西变成坐标，返回 (坐标, 说清楚是哪儿的名字)。
-
-    默认限定在家所在的城市里找 —— 不限的话"新街口"会解析到别的省去，
-    而且不报错（见 amap.city_of）。
+    解析逻辑本身在 amap.py —— 模型工具走的是同一个函数，只是它把错误
+    变成一句给模型看的话，而不是退出进程。
     """
-    if looks_like_coords(place):
-        return place, place
-
-    # 家在哪个市，就在哪个市里找。地址里自己写了城市的，高德会以地址为准。
-    city = amap.city_of(config.HOME) if config.HOME else ""
-    hits = amap.geocode(place, city=city)
-    if not hits:
-        where = f"在{city}" if city else ""
-        print(f"高德{where}找不到「{place}」。换个更完整的写法试试，比如带上区和路名。")
+    try:
+        hit = amap.resolve(place)
+    except amap.GeocodeError as e:
+        print(e)
         sys.exit(1)
-
-    best = hits[0]
-    # level 太粗说明它没找着，只好给了个市中心 —— 这种坐标查周边没意义，
-    # 与其静悄悄地返回一个错的，不如停下来说清楚。
-    if best["level"] in ("城市", "省", "国家"):
-        print(f"「{place}」只匹配到{best['level']}一级，坐标是 {best['formatted_address']}。")
-        print("太粗了，查周边没意义。地址写细一点，带上区和路名门牌号。")
-        sys.exit(1)
-
-    if not quiet:
-        print(f"「{place}」→ {best['location']}"
-              f"（{best['formatted_address']}，匹配到{best['level']}）")
-        if len(hits) > 1:
-            print(f"（还有 {len(hits) - 1} 个同名结果，用的是第一个。不对就写详细点）")
-
-    # 名字带上高德解析出的完整地址：重名的地方太多，光显示"新街口"
-    # 你没法判断它去的是哪个新街口。
-    return best["location"], f"{place}（{best['formatted_address']}）"
+    if hit["level"] != "坐标":
+        print(f"「{place}」→ {hit['location']}"
+              f"（{hit['formatted_address']}，匹配到{hit['level']}）")
+        if hit["alternatives"]:
+            print(f"（还有 {hit['alternatives']} 个同名结果，用的是第一个。不对就写详细点）")
+    return hit
 
 
 def show_where(place: str) -> None:
+    # 这里刻意不限城市：--where 就是用来查"到底有几个同名的地方"的
     hits = amap.geocode(place)
     if not hits:
         print(f"高德找不到「{place}」。换个更完整的写法试试，比如带上市和区。")
@@ -180,18 +152,20 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        location, label = resolve(place)
+        hit = resolve(place)
         print()
         if args.types:
-            show_types(location, args.radius)
+            show_types(hit["location"], args.radius)
         else:
-            show_places(location, label, args.keywords, args.radius,
+            show_places(hit["location"], hit["label"], args.keywords, args.radius,
                         args.max_cost, args.min_rating, args.limit)
     except amap.AmapError as e:
         print(f"高德拒绝了这次请求：{e}")
         if "LIMIT" in str(e) or "EXCEED" in str(e):
             print("这是配额/并发类的错误，不是 key 的问题。等一会儿再试，"
                   "或者去 lbs.amap.com 控制台看今天的用量。")
+        elif "30001" in str(e):
+            print("多半是地址高德解析不了。换个写法，或者用 --where 先查坐标。")
         else:
             print("常见原因：key 的平台类型不是「Web 服务」，或者 key 填错了。")
         sys.exit(1)
