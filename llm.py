@@ -14,6 +14,7 @@
 """
 
 import json
+from datetime import datetime
 
 from openai import OpenAI
 
@@ -46,6 +47,52 @@ def _fmt_log(r) -> str:
             + (f"（{r['note']}）" if r["note"] else ""))
 
 
+# ---------- 时间：模型没有时钟，得每轮告诉它 ----------
+
+def _time_hint() -> str:
+    """当前本地时间 + 星期，如 2026-08-11 16:20 周二。
+
+    带星期是因为用户会说"上周三"，模型光有日期推不出来。
+    刻意不给 UTC —— 模型侧一律说本地时间，换算交给 db.from_local()。
+    """
+    dt = datetime.now().astimezone()
+    return f"{dt.strftime(db.LOCAL_FMT)} 周{'一二三四五六日'[dt.weekday()]}"
+
+
+def user_message(text: str) -> dict:
+    """把用户的话包成消息，前面缀上当前时间。
+
+    模型没有时钟。不给它基准，"昨天下午"就填不出来，find_logs 返回的
+    08-11 是不是今天它也判断不了。
+
+    为什么缀在 user 消息上而不是写进 system prompt：prompt 缓存按前缀
+    匹配 —— 从头连续相同的那段才能复用，一个 token 对不上，从那里往后
+    全部作废。system 在列表最前面，时间戳每轮变，整段对话历史就全部
+    失配，越聊越贵。变化的东西必须待在列表末尾。
+
+    代价是 messages 里这条不再是原话，但 chat.py 记 events 用的是原始
+    字符串、不走 messages，留痕不受影响。
+    """
+    return {"role": "user", "content": f"[{_time_hint()}] {text}"}
+
+
+def _to_utc(args: dict, *keys: str) -> str | None:
+    """就地把 args 里的本地时间字段换成 UTC。格式不对就返回一句给模型看的话。
+
+    转换失败不抛异常 —— 这是模型填错了参数，不是程序坏了。给它一句
+    人话让它重填，比让异常冒泡打断整场对话强。
+    """
+    for k in keys:
+        if args.get(k):
+            try:
+                args[k] = db.from_local(args[k])
+            except ValueError:
+                return (f"{k}=「{args[k]}」格式不对。要写成 2026-08-10 15:00 这样的"
+                        f"本地时间，不能用「昨天下午」这种词——你得自己算出具体日期。"
+                        f"重新填一次。")
+    return None
+
+
 # ---------- 给模型的工具（全是 db.py 里的窄接口） ----------
 
 TOOLS = [
@@ -70,7 +117,18 @@ TOOLS = [
                         ),
                     },
                     "note": {"type": "string", "description": "用户对它的评价或补充。没有就不填"},
+                    "ts": {
+                        "type": "string",
+                        "description": (
+                            "这顿饭发生的本地时间，形如 2026-08-10 15:00。"
+                            "用户提到了时间（昨天下午、今天早上、周三中午）就必须填；"
+                            "完全没提时间就不填，默认记成现在。"
+                            "只说了时段没说几点，就用这套锚点："
+                            "上午 09:00 / 中午 12:00 / 下午 15:00 / 晚上 19:00。"
+                        ),
+                    },
                 },
+                # ts 刻意不设 required：设了就等于逼模型给每顿饭编一个时间。
                 "required": ["name"],
             },
         },
@@ -88,7 +146,17 @@ TOOLS = [
                 "properties": {
                     "kind": {"type": "string", "description": "记录类型，饮食填 meal。不填就查全部"},
                     "name": {"type": "string", "description": "按名称模糊匹配。不填就不按名称筛"},
-                    "days": {"type": "integer", "description": "往前看几天，默认 30"},
+                    "days": {"type": "integer", "description": "往前看几天，默认 30。问'最近'用这个"},
+                    "since": {
+                        "type": "string",
+                        "description": (
+                            "区间起点，本地时间，形如 2026-08-10 12:00。"
+                            "用户说了具体时段（今天中午、昨天下午、周三晚上）时用 since+until，"
+                            "别再给 days。时段展开成这些区间："
+                            "上午 06:00-12:00 / 中午 11:00-14:00 / 下午 12:00-18:00 / 晚上 17:00-23:00。"
+                        ),
+                    },
+                    "until": {"type": "string", "description": "区间终点，本地时间，格式同 since"},
                 },
             },
         },
@@ -108,6 +176,10 @@ TOOLS = [
                     "id": {"type": "integer", "description": "要改的记录 id，来自 find_logs 的结果"},
                     "name": {"type": "string", "description": "改成的新名称。不改就不填"},
                     "note": {"type": "string", "description": "改成的新备注。不改就不填"},
+                    "ts": {
+                        "type": "string",
+                        "description": "改成的新时间，本地格式如 2026-08-10 19:00。不改就不填",
+                    },
                 },
                 "required": ["id"],
             },
@@ -141,12 +213,19 @@ TOOLS = [
 def _run_tool(name: str, args: dict) -> str:
     """执行工具，返回给模型看的文本结果。"""
     if name == "log_meal":
-        db.log_meal(args["name"], note=args.get("note"))
-        return f"已记录：{args['name']}"
+        if err := _to_utc(args, "ts"):
+            return err
+        row_id = db.log_meal(args["name"], note=args.get("note"), ts=args.get("ts"))
+        # 回显必须带时间。模型能自己填 ts 了，它就会把"昨天下午"记成今天 ——
+        # 不当场打出来，这种错你要等到下次查记录才发现（设计文档 5.2）。
+        return f"已记录：{_fmt_log(db.get_log(row_id))}"
 
     if name == "find_logs":
+        if err := _to_utc(args, "since", "until"):
+            return err
         rows = db.find_logs(kind=args.get("kind"), name=args.get("name"),
-                            days=args.get("days", 30))
+                            days=args.get("days", 30),
+                            since=args.get("since"), until=args.get("until"))
         if not rows:
             return "没找到符合条件的记录。"
         return "\n".join(_fmt_log(r) for r in rows)
@@ -156,21 +235,27 @@ def _run_tool(name: str, args: dict) -> str:
         old = db.get_log(row_id)
         if old is None:
             return f"没有 id={row_id} 这条记录，先用 find_logs 确认 id。"
+        if err := _to_utc(args, "ts"):
+            return err
 
         changes = []
         if args.get("name"):
             changes.append(f"名称改成「{args['name']}」")
         if args.get("note"):
             changes.append(f"备注改成「{args['note']}」")
+        if args.get("ts"):
+            # 确认框里说的是本地时间 —— 给人看的东西不该出现 UTC
+            changes.append(f"时间改成「{db.to_local(args['ts'])}」")
         if not changes:
-            return "没说要改什么，name 和 note 至少给一个。"
+            return "没说要改什么，name / note / ts 至少给一个。"
 
         if not ui.confirm(f"要把这条{'，'.join(changes)}吗？", _fmt_log(old)):
             # 把拒绝如实告诉模型，让它知道这次没生效，别接着往下假设。
             return "用户拒绝了这次改动，记录没有变。"
 
-        db.correct_log(row_id, name=args.get("name"), note=args.get("note"))
-        return f"已更正 id={row_id}"
+        db.correct_log(row_id, name=args.get("name"), note=args.get("note"),
+                       ts=args.get("ts"))
+        return f"已更正：{_fmt_log(db.get_log(row_id))}"
 
     if name == "remember":
         db.remember(args["category"], args["key"], args["value"], source="voice")
@@ -187,7 +272,12 @@ def system_prompt() -> str:
         "用户提到吃了什么就调 log_meal 记下来，不用问他要不要记。",
         "用户说之前哪条记错了，先用 find_logs 查出来复述给他，确认是哪一条之后再用 correct_log。",
         "查不到的信息就说没查到，绝不编。编一家不存在的餐厅比不回答糟糕得多。",
+        "每条用户消息开头方括号里的是系统加的当前时间，不是用户说的内容，别复述它。"
+        "所有工具的时间参数都填本地时间，格式 2026-08-10 15:00。",
     ]
+    # 注意：这里刻意不拼当前时间。system prompt 在 messages 最前面，
+    # 它每轮一变，整段对话历史的 prompt 缓存就全部失配。时间走
+    # user_message() 缀在末尾（见那个函数的注释）。
 
     memories = db.active_memories()
     if memories:
@@ -211,6 +301,11 @@ def chat(messages: list[dict], verbose: bool = True) -> str:
                 "model": config.MODEL,
                 "prompt_tokens": resp.usage.prompt_tokens,
                 "completion_tokens": resp.usage.completion_tokens,
+                # 缓存命中数。时间戳缀在 user 消息末尾而不是写进 system prompt，
+                # 图的就是这个数字 —— 不记下来，这个决定有没有兑现就查不出来。
+                # getattr 兜底：不是每家兼容接口都返回这两个字段。
+                "cache_hit": getattr(resp.usage, "prompt_cache_hit_tokens", None),
+                "cache_miss": getattr(resp.usage, "prompt_cache_miss_tokens", None),
             })
 
         msg = resp.choices[0].message
@@ -232,9 +327,13 @@ def chat(messages: list[dict], verbose: bool = True) -> str:
 
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
-            result = _run_tool(tc.function.name, args)
+            # 先打印再执行，两个原因：确认框在 _run_tool 里弹，你得先看见
+            # 它要干什么再被问；而且 _to_utc 会就地把本地时间换成 UTC，
+            # 打印晚了就看不到模型原本填的是什么了 —— 这行的全部意义
+            # 就是"模型到底填了什么"。
             if verbose:
                 print(f"  · {tc.function.name}({', '.join(f'{k}={v}' for k, v in args.items())})")
+            result = _run_tool(tc.function.name, args)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     return "（工具调用绕了太多轮，我先停下了。）"

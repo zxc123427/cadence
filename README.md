@@ -43,6 +43,8 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 来自设计文档，现在遵守能省很多事：
 
 - **时间戳一律存 UTC + ISO 8601**，只在显示时转本地时区（5.6）
+- **模型只说本地时间，UTC 不出 `db.py`。** 工具参数一律填 `2026-08-10 15:00` 这种本地格式，`db.from_local()` 负责换算。让模型自己算时区，它会算错，而且错了不报错——一个格式不对的字符串塞进 TEXT 列，SQL 比较只会安静地给出错误结果
+- **当前时间缀在 user 消息上，不写进 system prompt。** prompt 缓存按前缀匹配，system 在 `messages` 最前面，它每轮一变，整段对话历史全部失配。变化的东西必须待在列表末尾
 - **记忆追加不覆盖**，所以 `--history` 查得到"它为什么这么以为"（5.4）
 - **`memories.key` 用归一化英文**（`food.dislike.cilantro`），人话放 `value`（5.4）
 - **模型只能调窄接口**，不能自己写 SQL（5.7）
@@ -52,6 +54,16 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 - 每次模型调用的 token 数写进 `events` 表 —— 没有账本就没有优化（12.1）
 
 ## 已知问题
+
+**空字符串能绕过确认框（已知，暂不修）**
+
+`llm.py` 判断"模型要不要改这个字段"用的是真假值（`args.get("name")`），
+`db.correct_log` 用的是 `is not None`。两边对空字符串的看法不一样：
+模型传 `{"id": 2, "name": "", "note": "x"}`，确认框只会显示"备注改成 x"，
+但 `correct_log` 会把 `name` 一并写成空串——**改了一个没经过确认的字段**。
+
+暂不修是因为还没见模型真传过空串。修的话两边统一成 `is not None`，
+并且把空串当非法输入挡掉（"清空"应该是显式操作，不是省略的副作用）。
 
 **输入偶尔丢字符（不复现，决定不修）**
 

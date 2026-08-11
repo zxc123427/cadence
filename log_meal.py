@@ -10,16 +10,19 @@
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 
 import db
 
 
 def parse_at(hhmm: str) -> str:
-    """把 '12:30' 理解成今天本地时间的 12:30，转成 UTC 存。"""
-    h, m = (int(x) for x in hhmm.split(":"))
-    local = datetime.now().astimezone().replace(hour=h, minute=m, second=0, microsecond=0)
-    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """把 '12:30' 理解成今天本地时间的 12:30，转成 UTC 存。
+
+    补上今天的日期就交给 db.from_local —— 时区换算和格式字面量
+    只该有一处实现，别在每个入口各写一遍。
+    """
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    return db.from_local(f"{today} {hhmm}")
 
 
 def main() -> None:

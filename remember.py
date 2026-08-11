@@ -69,7 +69,7 @@ def main() -> None:
     expires_at = None
     if args.expires:
         expires_at = (datetime.now(timezone.utc) + timedelta(days=args.expires)
-                      ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                      ).strftime(db.TS_FMT)
 
     old = db.memory_history(args.key)
     db.remember(args.category, args.key, args.value, expires_at=expires_at)

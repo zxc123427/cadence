@@ -32,8 +32,10 @@ def main() -> None:
         if not user:
             continue
 
+        # events 记的是原话；messages 里那条会被 llm 缀上当前时间。
+        # 留痕看 events，别看 messages。
         db.record_event("cli", "utterance", {"text": user})
-        messages.append({"role": "user", "content": user})
+        messages.append(llm.user_message(user))
 
         try:
             reply = llm.chat(messages)

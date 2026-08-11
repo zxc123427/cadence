@@ -59,19 +59,41 @@ CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key, created_at);
 
 # ---------- 时间：存 UTC，显示本地 ----------
 
+# 库里所有时间戳的格式。只此一份，别再散着写字面量。
+TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+# 人说的时间格式。模型和 CLI 只用这个，UTC 不出 db.py 这一层。
+LOCAL_FMT = "%Y-%m-%d %H:%M"
+
+
 def now() -> str:
     """当前时间，UTC ISO 8601。所有写库的时间戳都用它。"""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(TS_FMT)
 
 
 def days_ago(n: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime(TS_FMT)
 
 
 def to_local(ts: str) -> str:
     """UTC 时间戳 -> 本地时间的可读字符串。只用于显示，不要写回库里。"""
-    dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(ts, TS_FMT).replace(tzinfo=timezone.utc)
     return dt.astimezone().strftime("%m-%d %H:%M")
+
+
+def from_local(s: str) -> str:
+    """to_local 的逆：本地时间 "2026-08-10 15:00" -> UTC ISO。
+
+    存在的理由：模型没有可靠的时区算术能力。让它填 UTC，它得把
+    "昨天下午三点"减一天再减八小时，算错了还不报错，静默写进库。
+    所以模型只说本地时间，换算放在这里做一次。
+
+    格式不对就抛 ValueError，绝不猜。ts 是 TEXT 列，一个格式不对的
+    字符串塞进去，SQL 比较不会报错，只会安静地给出错误结果。
+    """
+    dt = datetime.strptime(s.strip(), LOCAL_FMT)      # 格式不对在这里就炸
+    # strptime 出来的是 naive datetime；astimezone 会按系统本地时区解释它
+    return dt.astimezone(timezone.utc).strftime(TS_FMT)
 
 
 # ---------- 连接 ----------
@@ -108,12 +130,17 @@ def log_meal(name: str, note: str | None = None, ts: str | None = None) -> int:
     return cur.lastrowid
 
 
-def correct_log(row_id: int, name: str | None = None, note: str | None = None) -> bool:
-    """更正一条记录。id 不存在时返回 False。
+def correct_log(row_id: int, name: str | None = None, note: str | None = None,
+                ts: str | None = None) -> bool:
+    """更正一条记录。id 不存在时返回 False。ts 传 UTC ISO。
 
     logs 用真改、不留旧版本：memories 追加不覆盖是因为"我曾经这么以为"
     本身有价值；而 logs 里一条抽错的记录不是历史，它从来就不是真的。
     留痕交给 events —— 旧值进流水账，事后能查出改过什么。
+
+    ts 也能改：模型现在可以自己填时间了（llm.py 的 log_meal 有 ts 参数），
+    那它就会把时间填错。凡是模型写得进去的字段都必须改得回来，
+    否则等于开了一个只写不可救的坑（设计文档 5.2）。
     """
     with connect() as conn:
         old = conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
@@ -121,13 +148,14 @@ def correct_log(row_id: int, name: str | None = None, note: str | None = None) -
             return False
         new_name = name if name is not None else old["name"]
         new_note = note if note is not None else old["note"]
-        conn.execute("UPDATE logs SET name = ?, note = ? WHERE id = ?",
-                     (new_name, new_note, row_id))
+        new_ts = ts if ts is not None else old["ts"]
+        conn.execute("UPDATE logs SET name = ?, note = ?, ts = ? WHERE id = ?",
+                     (new_name, new_note, new_ts, row_id))
 
     record_event("cli", "correct_log", {
         "id": row_id,
-        "old": {"name": old["name"], "note": old["note"]},
-        "new": {"name": new_name, "note": new_note},
+        "old": {"name": old["name"], "note": old["note"], "ts": old["ts"]},
+        "new": {"name": new_name, "note": new_note, "ts": new_ts},
     })
     return True
 
@@ -175,18 +203,42 @@ def remember(category: str, key: str, value: str,
 
 # ---------- 窄接口：读 ----------
 
-def find_logs(kind: str | None = None, name: str | None = None,
-              days: int = 30) -> list[sqlite3.Row]:
+def find_logs(kind: str | None = None, name: str | None = None, days: int = 30,
+              since: str | None = None, until: str | None = None) -> list[sqlite3.Row]:
     """按条件找记录。返回的行带 id —— 更正和删除都要靠 id 定位。
 
     为什么不直接按名字改删：名字会重复。"牛肉面"你可能吃过三次，
     按名字动手会一次改掉三条。所以 kind / name / 时间只负责「找到」，
     真正动手的依据永远是 id。
+
+    时间有两种问法，共用同一个查询：
+      days              —— "最近几天"，单边下界，粗筛用
+      since / until     —— 一个区间，"今天中午"这种具体时段用（UTC ISO）
+    给了 since 或 until 就按区间走，days 作废。两个都不给才回到 days。
     """
+    # 区间的值来自模型，必须校验。ts 是 TEXT 列，格式不对的字符串
+    # 比较不会报错，只会安静地给出错误结果 —— 那种 bug 最难查。
+    for label, v in (("since", since), ("until", until)):
+        if v is not None:
+            try:
+                datetime.strptime(v, TS_FMT)
+            except ValueError:
+                raise ValueError(f"{label} 要 UTC ISO 格式（{TS_FMT}），收到的是：{v!r}")
+
     # 注意：这里的 f-string 只拼固定的条件片段，所有「值」仍然走 ? 参数。
     # 千万别把 name 之类的内容直接拼进 SQL 字符串里。
-    where = ["ts >= ?"]
-    params: list = [days_ago(days)]
+    where: list[str] = []
+    params: list = []
+    if since is None and until is None:
+        where.append("ts >= ?")
+        params.append(days_ago(days))
+    else:
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        if until is not None:
+            where.append("ts <= ?")
+            params.append(until)
     if kind:
         where.append("kind = ?")
         params.append(kind)
