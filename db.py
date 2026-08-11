@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS logs (
     ts         TEXT NOT NULL,           -- 事情发生的时间（UTC）
     created_at TEXT NOT NULL,           -- 写进库的时间（UTC），两者可以不同
     note       TEXT,
+    place      TEXT,                    -- 在哪家店吃的。在家做饭就为空
     extra      TEXT                     -- JSON 杂项
 );
 CREATE INDEX IF NOT EXISTS idx_logs_kind_ts ON logs(kind, ts);
@@ -96,13 +97,41 @@ def from_local(s: str) -> str:
     return dt.astimezone(timezone.utc).strftime(TS_FMT)
 
 
-# ---------- 连接 ----------
+# ---------- 连接与迁移 ----------
+
+# 后来才加的列。表已经存在时，改上面的 SCHEMA 是没用的 ——
+# CREATE TABLE IF NOT EXISTS 看见表在就直接跳过，不会去补列。
+# 所以每加一列都要在这里登记一笔，由 _migrate() 补上。
+#
+# 新库走 SCHEMA 一次建全，老库走这里补齐，两条路结果一样。
+NEW_COLUMNS = [
+    ("logs", "place", "TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把已存在的表补成 SCHEMA 描述的样子。
+
+    幂等：跑多少次结果都一样 —— 先问表里现在有哪些列，缺了才加。
+    所以它可以放在每次 connect() 里，不需要记"迁移到第几版了"。
+
+    只加列，不改列、不删列。SQLite 对后两者支持很差，真要做的时候
+    正规做法是"建新表 → 搬数据 → 换名字"，那一步该单独写脚本、
+    单独备份，不该藏在 connect() 里悄悄发生。
+    """
+    for table, column, coltype in NEW_COLUMNS:
+        # PRAGMA table_info 返回这张表的所有列，row[1] 是列名
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
 
 def connect() -> sqlite3.Connection:
-    """打开数据库，第一次会自动建表。"""
+    """打开数据库，第一次会自动建表，老库自动补新列。"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row          # 让查询结果能用列名访问：row["name"]
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -118,20 +147,22 @@ def record_event(source: str, type: str, payload: dict | None = None) -> int:
         return cur.lastrowid
 
 
-def log_meal(name: str, note: str | None = None, ts: str | None = None) -> int:
-    """记一顿饭。ts 不传就是现在。"""
+def log_meal(name: str, note: str | None = None, ts: str | None = None,
+             place: str | None = None) -> int:
+    """记一顿饭。ts 不传就是现在，place 是店名（在家吃就不传）。"""
     ts = ts or now()
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO logs (kind, name, ts, created_at, note) VALUES ('meal', ?, ?, ?, ?)",
-            (name, ts, now(), note),
+            "INSERT INTO logs (kind, name, ts, created_at, note, place)"
+            " VALUES ('meal', ?, ?, ?, ?, ?)",
+            (name, ts, now(), note, place),
         )
-    record_event("cli", "log_meal", {"name": name, "note": note})
+    record_event("cli", "log_meal", {"name": name, "note": note, "place": place})
     return cur.lastrowid
 
 
 def correct_log(row_id: int, name: str | None = None, note: str | None = None,
-                ts: str | None = None) -> bool:
+                ts: str | None = None, place: str | None = None) -> bool:
     """更正一条记录。id 不存在时返回 False。ts 传 UTC ISO。
 
     logs 用真改、不留旧版本：memories 追加不覆盖是因为"我曾经这么以为"
@@ -149,13 +180,17 @@ def correct_log(row_id: int, name: str | None = None, note: str | None = None,
         new_name = name if name is not None else old["name"]
         new_note = note if note is not None else old["note"]
         new_ts = ts if ts is not None else old["ts"]
-        conn.execute("UPDATE logs SET name = ?, note = ?, ts = ? WHERE id = ?",
-                     (new_name, new_note, new_ts, row_id))
+        new_place = place if place is not None else old["place"]
+        conn.execute(
+            "UPDATE logs SET name = ?, note = ?, ts = ?, place = ? WHERE id = ?",
+            (new_name, new_note, new_ts, new_place, row_id))
 
     record_event("cli", "correct_log", {
         "id": row_id,
-        "old": {"name": old["name"], "note": old["note"], "ts": old["ts"]},
-        "new": {"name": new_name, "note": new_note, "ts": new_ts},
+        "old": {"name": old["name"], "note": old["note"], "ts": old["ts"],
+                "place": old["place"]},
+        "new": {"name": new_name, "note": new_note, "ts": new_ts,
+                "place": new_place},
     })
     return True
 
@@ -176,7 +211,7 @@ def delete_log(row_id: int) -> sqlite3.Row | None:
 
     record_event("cli", "delete_log", {
         "id": row_id, "kind": row["kind"], "name": row["name"],
-        "note": row["note"], "ts": row["ts"],
+        "note": row["note"], "ts": row["ts"], "place": row["place"],
     })
     return row
 
@@ -261,6 +296,32 @@ def recent_meals(days: int = 7) -> list[sqlite3.Row]:
 def get_log(row_id: int) -> sqlite3.Row | None:
     with connect() as conn:
         return conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
+
+
+def place_history(place: str) -> list[sqlite3.Row]:
+    """这家店的全部记录，新的在前。没去过就是空列表。
+
+    这是整个推荐功能的支点。高德能告诉你附近有什么，但"这家你去过两次、
+    上次说排队久但值"只有这张表有 —— 设计文档 7.5 说的、赢得过美团的
+    唯一原因就是这一条。
+
+    ⚠️ 匹配用双向包含，因为两边的名字粒度对不上：
+       库里存的是你随口说的「随园餐厅」，高德给的是「随园餐厅(仙鹤门店)」。
+    双向是必要的 —— 拿高德的长名字来查，要匹配库里的短名字；
+    拿你说的短名字来查，要匹配库里可能存过的长名字。
+
+    匹配不上就返回空，调用方必须如实说"没有记录"，不许猜（文档 7.4）。
+    """
+    place = (place or "").strip()
+    if not place:
+        return []
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM logs WHERE place IS NOT NULL AND place != ''"
+            "  AND (? LIKE '%' || place || '%' OR place LIKE ?)"
+            " ORDER BY ts DESC",
+            (place, f"%{place}%"),
+        ).fetchall()
 
 
 def active_memories() -> list[sqlite3.Row]:

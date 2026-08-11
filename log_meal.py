@@ -4,6 +4,7 @@
     python3 log_meal.py 牛肉面
     python3 log_meal.py 牛肉面 --note 有点咸
     python3 log_meal.py 麻辣烫 --at 12:30
+    python3 log_meal.py 烤羊腿 --place 随园餐厅 --note 排队久但值
 
 这是设计文档 8.2 说的那种 CLI 脚本：以后语音、事件循环、别的 AI 工具
 调的都是同一个脚本，不用为每个入口重写一遍。
@@ -30,13 +31,16 @@ def main() -> None:
     p.add_argument("name", help="吃了什么，例如 牛肉面")
     p.add_argument("--note", help="备注，例如 有点咸 / 太贵了")
     p.add_argument("--at", help="几点吃的，格式 HH:MM，默认现在")
+    p.add_argument("--place", help="在哪家店吃的。在家做饭就不填")
     args = p.parse_args()
 
     ts = parse_at(args.at) if args.at else None
-    db.log_meal(args.name, note=args.note, ts=ts)
+    db.log_meal(args.name, note=args.note, ts=ts, place=args.place)
 
     when = db.to_local(ts) if ts else "刚刚"
-    print(f"记下了：{args.name}（{when}）" + (f" —— {args.note}" if args.note else ""))
+    print(f"记下了：{args.name}"
+          + (f" @{args.place}" if args.place else "")
+          + f"（{when}）" + (f" —— {args.note}" if args.note else ""))
 
 
 if __name__ == "__main__":

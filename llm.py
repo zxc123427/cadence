@@ -18,8 +18,10 @@ from datetime import datetime
 
 from openai import OpenAI
 
+import amap
 import config
 import db
+import places
 import ui
 
 # 一次对话里最多跑几轮工具调用。防的不是逻辑错误，是"模型和工具互相刷屏
@@ -44,7 +46,43 @@ def _client() -> OpenAI:
 
 def _fmt_log(r) -> str:
     return (f"id={r['id']}  {db.to_local(r['ts'])}  {r['kind']}  {r['name']}"
+            + (f" @{r['place']}" if r["place"] else "")
             + (f"（{r['note']}）" if r["note"] else ""))
+
+
+# ---------- 地点：中心点要跟着对话走 ----------
+
+# 本次会话最后用过的中心点，(坐标, 用户说的那个名字)。
+#
+# 为什么要记：用户说完"新街口"，下一轮问"那边有火锅吗"，模型很可能不填
+# near，于是悄悄退回家附近 —— 而用户发现不了，因为返回的店名他本来就
+# 不认识。靠 system prompt 写一句"请沿用最近提到的地点"是不够的，模型
+# 可能听可能不听，事后还查不出为什么没听（设计文档 6.1）。
+#
+# 所以这里用确定性代码兜住，并且**每次都把用的是哪儿回显出去**。
+_last_center: tuple[str, str] | None = None
+
+
+def _resolve_center(near: str | None) -> tuple[str, str]:
+    """定这次查询的中心点，返回 (坐标, 给人看的名字)。
+
+    优先级：这次说了 > 上次用过的 > .env 里的家。
+    """
+    global _last_center
+    if near:
+        _last_center = places.resolve(near, quiet=True)
+    elif _last_center is None:
+        if not config.HOME:
+            raise ValueError("没有默认地点。要么在问题里说个地方，"
+                             "要么在 .env 里加一行 CADENCE_HOME=经度,纬度")
+        _last_center = (config.HOME, "家")
+    return _last_center
+
+
+def reset_center() -> None:
+    """新会话开始时清掉。chat.py 每次启动调一次。"""
+    global _last_center
+    _last_center = None
 
 
 # ---------- 时间：模型没有时钟，得每轮告诉它 ----------
@@ -117,6 +155,13 @@ TOOLS = [
                         ),
                     },
                     "note": {"type": "string", "description": "用户对它的评价或补充。没有就不填"},
+                    "place": {
+                        "type": "string",
+                        "description": (
+                            "在哪家店吃的。用户提到了店名就填，在家做饭/没提就不填。"
+                            "只填店名本身，不要加「那家」「附近的」这类修饰词。"
+                        ),
+                    },
                     "ts": {
                         "type": "string",
                         "description": (
@@ -180,8 +225,71 @@ TOOLS = [
                         "type": "string",
                         "description": "改成的新时间，本地格式如 2026-08-10 19:00。不改就不填",
                     },
+                    "place": {"type": "string", "description": "改成的新店名。不改就不填"},
                 },
                 "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_place_types",
+            "description": (
+                "看某个地方实际有哪些餐饮分类。用户没说想吃什么（「今天吃什么」「随便推荐个」）"
+                "时先调这个，拿到方向再去 find_places。"
+                "find_places 说关键词不对时也调它。"
+                "⚠️ 它要拉全量，慢（几秒），别在已经知道要查什么的时候调。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "near": {
+                        "type": "string",
+                        "description": (
+                            "地点名，如 新街口。用户这轮提到了新地方才填；"
+                            "没提就不填，系统会自动沿用上一次用过的地点。"
+                        ),
+                    },
+                    "radius": {"type": "integer", "description": "半径米数，默认 3000"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_places",
+            "description": (
+                "查附近有哪些店，结果里会标出用户去过哪几家、当时说了什么。"
+                "推荐吃饭的地方就用它。\n"
+                "⚠️ keyword 必须是**真实存在的分类名或店名**。高德那边是文本匹配，"
+                "「辣的」「清淡」「好吃的」这种描述词查出来的全是蒙的。"
+                "用户说「想吃辣的」，你要自己翻译成具体菜系（四川菜,湖南菜,云贵菜,火锅）再查。"
+                "不确定这一带有哪些菜系就先调 list_place_types。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": (
+                            "分类名或店名，如 四川菜、日本料理、火锅、随园餐厅。"
+                            "逗号分隔可以一次给多个，如 四川菜,湖南菜,火锅。"
+                        ),
+                    },
+                    "near": {
+                        "type": "string",
+                        "description": (
+                            "地点名，如 新街口。用户这轮提到了新地方才填；"
+                            "没提就不填，系统会自动沿用上一次用过的地点。"
+                        ),
+                    },
+                    "radius": {"type": "integer", "description": "半径米数，默认 3000"},
+                    "max_cost": {"type": "number", "description": "人均不超过多少元。用户提了预算才填"},
+                    "min_rating": {"type": "number", "description": "评分不低于多少。用户明确要求才填"},
+                },
+                "required": ["keyword"],
             },
         },
     },
@@ -215,7 +323,8 @@ def _run_tool(name: str, args: dict) -> str:
     if name == "log_meal":
         if err := _to_utc(args, "ts"):
             return err
-        row_id = db.log_meal(args["name"], note=args.get("note"), ts=args.get("ts"))
+        row_id = db.log_meal(args["name"], note=args.get("note"), ts=args.get("ts"),
+                             place=args.get("place"))
         # 回显必须带时间。模型能自己填 ts 了，它就会把"昨天下午"记成今天 ——
         # 不当场打出来，这种错你要等到下次查记录才发现（设计文档 5.2）。
         return f"已记录：{_fmt_log(db.get_log(row_id))}"
@@ -246,22 +355,104 @@ def _run_tool(name: str, args: dict) -> str:
         if args.get("ts"):
             # 确认框里说的是本地时间 —— 给人看的东西不该出现 UTC
             changes.append(f"时间改成「{db.to_local(args['ts'])}」")
+        if args.get("place"):
+            changes.append(f"地点改成「{args['place']}」")
         if not changes:
-            return "没说要改什么，name / note / ts 至少给一个。"
+            return "没说要改什么，name / note / ts / place 至少给一个。"
 
         if not ui.confirm(f"要把这条{'，'.join(changes)}吗？", _fmt_log(old)):
             # 把拒绝如实告诉模型，让它知道这次没生效，别接着往下假设。
             return "用户拒绝了这次改动，记录没有变。"
 
         db.correct_log(row_id, name=args.get("name"), note=args.get("note"),
-                       ts=args.get("ts"))
+                       ts=args.get("ts"), place=args.get("place"))
         return f"已更正：{_fmt_log(db.get_log(row_id))}"
 
     if name == "remember":
         db.remember(args["category"], args["key"], args["value"], source="voice")
         return f"已记住：{args['value']}"
 
+    if name in ("find_places", "list_place_types"):
+        return _run_place_tool(name, args)
+
     return f"没有这个工具：{name}"
+
+
+def _been_there(store: str) -> str:
+    """这家店用户去过没有。空字符串表示没记录。
+
+    这一行就是整个推荐功能的支点：高德能说出附近有什么，但"这家你去过两次、
+    上次说排队久但值"只有 logs 有。设计文档 7.5 说的、赢得过美团的唯一原因
+    就是这一条 —— 所以候选集里每一家都要过一遍这个函数。
+    """
+    rows = db.place_history(store)
+    if not rows:
+        return ""
+    last = rows[0]
+    out = f"你去过{len(rows)}次，最近 {db.to_local(last['ts'])}"
+    if last["name"]:
+        out += f"吃的{last['name']}"
+    if last["note"]:
+        out += f"，你说「{last['note']}」"
+    return out
+
+
+def _run_place_tool(name: str, args: dict) -> str:
+    """find_places / list_place_types。两个都要先定中心点，所以放在一起。"""
+    try:
+        center, label = _resolve_center(args.get("near"))
+    except (ValueError, SystemExit) as e:
+        return f"定位不了这个地方：{e}。让用户说得具体一点。"
+
+    radius = args.get("radius") or 3000
+
+    try:
+        if name == "list_place_types":
+            got = amap.list_types(center, radius)
+            listed = "｜".join(f"{t} {n}" for t, n in got["types"][:25])
+            return (f"以「{label}」为中心 {radius} 米内共 {got['total']} 家餐饮，"
+                    f"抽样 {got['sampled']} 家，分类分布：\n{listed}\n"
+                    f"（家数是抽样的，只能看出有哪些菜系，别拿数字做比较。"
+                    f"查具体的店请用上面这些分类名调 find_places。）")
+
+        keyword = args["keyword"]
+        got = amap.search_keywords(center, keyword, radius)
+    except amap.AmapError as e:
+        # 如实报错，不要退回一个空列表让模型以为"这一带没有"（文档 7.4）
+        return f"高德这次没返回数据：{e}。告诉用户查询失败了，不要编。"
+    except OSError as e:
+        return f"网络请求失败：{e}。告诉用户查询失败了，不要编。"
+
+    pois = got["pois"]
+    if (mc := args.get("max_cost")) is not None:
+        # 缺数据的一律保留：把没评分的店悄悄筛掉，等于让一家店因为高德
+        # 没收录而消失，那是在替用户做他没要求的决定。
+        pois = [p for p in pois if p["cost"] is None or p["cost"] <= mc]
+    if (mr := args.get("min_rating")) is not None:
+        pois = [p for p in pois if p["rating"] is None or p["rating"] >= mr]
+
+    if not pois:
+        return (f"以「{label}」为中心 {radius} 米内没有符合条件的「{keyword}」。"
+                f"可以调 list_place_types 看看这一带实际有什么，再换个方向问用户。")
+
+    if got["loose"]:
+        return (f"「{keyword}」不是高德认得的分类名或店名 —— 它返回的 "
+                f"{len(got['pois'])} 家里没有一家的分类或店名真含这个词，全是蒙的，"
+                f"已经丢弃。请调 list_place_types 拿到这一带真实存在的分类名，"
+                f"再用那些名字重查。不要拿这次的结果推荐给用户。")
+
+    lines = [f"以「{label}」为中心 {radius} 米内的「{keyword}」，{len(pois)} 家："]
+    for p in pois[:40]:      # 兜底上限，不是筛选（文档 12.1）
+        bits = [f"{p['name']}", p["short_type"], f"{p['distance']}m"]
+        if p["rating"]:
+            bits.append(f"★{p['rating']}")
+        if p["cost"]:
+            bits.append(f"¥{p['cost']:.0f}")
+        line = "  ".join(bits)
+        if been := _been_there(p["name"]):
+            line += f"  ← {been}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # ---------- system prompt ----------
@@ -271,6 +462,11 @@ def system_prompt() -> str:
         "你是 cadence，一个只服务于一个人的私人助手。说话简短、直接，不用客服腔，不要每句都确认。",
         "用户提到吃了什么就调 log_meal 记下来，不用问他要不要记。",
         "用户说之前哪条记错了，先用 find_logs 查出来复述给他，确认是哪一条之后再用 correct_log。",
+        "推荐吃的地方之前，先用 find_logs 看他最近吃了什么，别推他刚吃过的。",
+        "find_places 的结果里标了「你去过N次」的，一定要把去过几次、上次说了什么讲出来 ——"
+        "这是他自己的记录，比评分有用得多。没标的就是没去过，别编成去过。",
+        "用户没说想吃什么就先调 list_place_types，拿着这一带真实有的菜系给他两三个具体方向，"
+        "别空口问「你想吃什么」。",
         "查不到的信息就说没查到，绝不编。编一家不存在的餐厅比不回答糟糕得多。",
         "每条用户消息开头方括号里的是系统加的当前时间，不是用户说的内容，别复述它。"
         "所有工具的时间参数都填本地时间，格式 2026-08-10 15:00。",

@@ -18,6 +18,9 @@ import llm
 def main() -> None:
     config.check()
 
+    # 地点是会话状态：上一场对话查过新街口，这一场不该还停在新街口。
+    llm.reset_center()
+
     n = len(db.active_memories())
     print(f"cadence（{config.MODEL}）· 已知 {n} 条关于你的事 · Ctrl-C 退出\n")
 

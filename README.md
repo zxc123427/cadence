@@ -1,12 +1,18 @@
-# cadence · v0
+# cadence · v0.1
 
-设计文档见 `个人AI助手项目设计文档.md`。这里是它第 13 节说的 v0：
-**敲字 → 查库 → 调模型 → 写库**。没有语音、没有摄像头、没有 agent 框架。
+设计文档见 `个人AI助手项目设计文档.md`。这里是它第 13 节路线图的阶段 1：
+**记饮食 → 查高德拿候选 → 用自己的记录筛 → 推荐**。
+没有语音、没有摄像头、没有 agent 框架。
 
 ## 开始用
 
 1. 打开 `.env`，把你那家模型的三行取消注释，填上 API KEY
-2. `python3 chat.py`
+2. 想用地点推荐再加两行（不加也能跑，只是没有 `places.py`）：
+   ```
+   CADENCE_AMAP_KEY=在 lbs.amap.com 申请，平台类型必须选「Web 服务」
+   CADENCE_HOME=经度,纬度        # 用 python3 places.py --where 你家地址 查
+   ```
+3. `python3 chat.py`
 
 ## 命令
 
@@ -15,8 +21,15 @@ python3 chat.py                                    # 对话（需要 API KEY）
 
 python3 log_meal.py 牛肉面 --note 有点咸            # 记一顿饭
 python3 log_meal.py 麻辣烫 --at 12:30
+python3 log_meal.py 烤羊腿 --place 随园餐厅          # 记在哪家店吃的
 python3 meals.py --days 7                          # 看最近吃了什么（带 id）
 python3 meals.py --delete 3                        # 删一条（只有你能删，模型不能）
+
+python3 places.py --types                          # 这一带实际有哪些菜系
+python3 places.py 四川菜                            # 查这类店，带上"你去过没有"
+python3 places.py 四川菜,湘菜,火锅 --max-cost 60     # 多个关键词、限人均
+python3 places.py 火锅 --at 新街口                   # 换个中心点，地址自动转坐标
+python3 places.py --where 新街口                    # 只查坐标
 
 python3 remember.py --list                         # 当前有效的记忆
 python3 remember.py preference food.dislike.cilantro "不吃香菜"
@@ -24,7 +37,7 @@ python3 remember.py constraint diet.goal "在减脂" --expires 90
 python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版本
 ```
 
-不用 API KEY 也能跑除 `chat.py` 外的全部命令。
+不用模型 API KEY 也能跑除 `chat.py` 外的全部命令（`places.py` 要高德 key）。
 
 ## 文件
 
@@ -32,11 +45,15 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 |---|---|
 | `db.py` | **所有读写的唯一入口**。没有 `execute_sql()`，只有具体函数（文档 5.7） |
 | `llm.py` | system prompt、工具定义、工具调用循环 |
+| `amap.py` | 高德接口。**只回答"附近有什么"**，不含任何个人偏好逻辑 |
 | `ui.py` | **跟人确认的唯一入口**。换语音时只改这一个文件 |
-| `config.py` / `.env` | 模型配置。换厂商只改 `.env` |
+| `config.py` / `.env` | 模型和高德的配置。换厂商只改 `.env` |
 | `chat.py` | 对话入口 |
-| `log_meal.py` / `meals.py` / `remember.py` | 独立 CLI 脚本（文档 8.2） |
+| `log_meal.py` / `meals.py` / `remember.py` / `places.py` | 独立 CLI 脚本（文档 8.2） |
 | `cadence.db` | SQLite 单文件。删掉就是重来 |
+
+**高德的数据一条都不落库。** 库里只有你自己的东西：吃了什么、在哪吃的、
+说过什么。候选集随时能重新拿到，个人记录拿不回来 —— 只有后者值得存。
 
 ## 已经定下来的纪律
 
@@ -51,7 +68,18 @@ python3 remember.py --history food.dislike.cilantro   # 一个 key 的全部版�
 - **模型能改不能删。** 删除不可逆、更正可逆，风险差一档，所以删除权留在 CLI 里（5.7）
 - **确认只能走 `ui.confirm()`，别在别处写 `input()`。** 写在 system prompt 里的"请先确认"不算数——模型可能不听，而且你查不出为什么（6.1）
 - **查不到就说查不到，不编**（7.4）
+- **候选集和判断依据必须分开。** 高德只回答"附近有什么"，"哪家合适"只能由
+  `logs` 和 `memories` 回答。让高德评分参与主排序，就是放弃这个项目唯一的优势（7.5）
+- **地点是会话状态，用代码兜住，而且必须回显。** 说过"新街口"之后模型可能忘了填
+  `near` 就悄悄退回家，而你看不出来——所以 `llm.py` 记住上一个中心点，
+  并且每次返回都写明用的是哪儿（6.1 的同一个道理）
+- **高德不认得的词要当场丢掉。** 搜「辣的」它不返回 0 条，而是给你八家肯德基。
+  乱猜比查不到更危险：查不到你会改词，乱猜你会真把肯德基当辣菜推出去（7.4）
+- **地名一律限定城市，并且把解析出的完整地址显示出来。** 不限城市查「新街口」，
+  高德给的是**四川乐山**的那个，还不报错。重名是常态不是意外
 - 每次模型调用的 token 数写进 `events` 表 —— 没有账本就没有优化（12.1）
+- **加表加列走 `db.py` 的 `NEW_COLUMNS`。** `CREATE TABLE IF NOT EXISTS` 对已存在的表
+  不生效，光改 `SCHEMA` 老库不会长出新列。改结构前先 `cp cadence.db` 备份
 
 ## 已知问题
 
@@ -88,12 +116,24 @@ sqlite3 cadence.db "SELECT payload FROM events WHERE type='utterance' ORDER BY i
 
 ## 下一步
 
-按文档 13 节的路线图，阶段 1 还差**高德 POI 推荐**：
-用饮食日志筛选候选餐厅，验证文档 7.5 的判断 ——
-赢过美团的不是商家数据，是"你上周吃了三次辣、这家你说过难吃"。
+**阶段 1 齐了，现在开始的两周是判据期。** 不加新功能，就用。
 
-两周后的通过判据（事先写好，达不到就砍不修）：
+判据是事先写好的，达不到就砍不修：
 **我主动用了 ≥10 次，且 ≥3 次真按它说的吃了。**
+
+想让它变准，唯一要做的事是**吃完记一笔，带上店名和一句真话**：
+
+```bash
+python3 log_meal.py 烤羊腿 --place 随园餐厅 --note 排队久但值
+```
+
+去过的店下次会带着这句话出现在推荐里。记录攒不起来，推荐就只是个搜索框。
+
+两周后再看这几件事值不值得做（现在都不做）：
+
+- 高德那条慢路（"今天吃什么"要拉全量，四到六秒）——只缓存那一行分类目录就能解决
+- 吃完主动问"这家怎么样"——属于文档 6 的主动性策略层，要走闸门
+- `logs.place` 存菜系，才能回答"我这个月吃了几次川菜"
 
 ## 备份
 
