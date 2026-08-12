@@ -12,7 +12,7 @@
 「辣的」「清淡」这种描述词一条都搜不出来 —— 先 --types 看目录，从里面挑。
 
 这个脚本替代了原来的 nearby.py：那个名字只讲了"附近"，但它还要管
-地址解析和分类目录，跟 meals.py / remember.py 一样按概念命名更清楚。
+地址解析和分类目录，跟 logs.py / remember.py 一样按概念命名更清楚。
 """
 
 import argparse
@@ -73,15 +73,29 @@ def show_types(location: str, radius: int) -> None:
 
 
 def history_note(name: str) -> str:
-    """这家店我去过没有。空字符串表示没记录。"""
+    """这个地方我去过没有 / 约了要去没有。空字符串表示一条记录都没有。
+
+    "去过"和"约了要去"直接按 status 分，不拿时间戳去猜 —— status 存的
+    就是这件事发生了没有。llm.py 的 _been_there 是同一套逻辑的模型版
+    （一份给人看、一份给模型看，跟 amap.resolve / places.resolve 同一个模式）。
+    """
     rows = db.place_history(name)
     if not rows:
         return ""
-    last = rows[0]
-    note = f"去过{len(rows)}次，最近 {db.to_local(last['ts'])}"
-    if last["note"]:
-        note += f"，你说过「{last['note']}」"
-    return note
+    done = [r for r in rows if r["status"] == "done"]
+    planned = [r for r in rows if r["status"] == "planned"]
+
+    parts = []
+    if done:
+        last = done[0]
+        bit = f"去过{len(done)}次，最近 {db.to_local(last['ts'])}"
+        if last["note"]:
+            bit += f"，你说过「{last['note']}」"
+        parts.append(bit)
+    for r in planned:
+        when = db.to_local(r["ts"])
+        parts.append(f"{when} 约了要去" + ("（那天已经过了）" if r["ts"] < db.now() else ""))
+    return "；".join(parts)
 
 
 def show_places(location: str, label: str, keywords: str, radius: int,

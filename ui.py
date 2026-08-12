@@ -1,6 +1,6 @@
 """跟人当面确认的唯一入口。
 
-单独成一个模块，是因为 llm.py 和 meals.py 都要用它，而 meals.py
+单独成一个模块，是因为 llm.py 和 logs.py 都要用它，而 logs.py
 不该为了问一句话就把 openai 和 config 拖进来。
 
 ⚠️ 两条纪律：

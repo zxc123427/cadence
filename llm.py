@@ -5,7 +5,7 @@
   5.3 always-on 注入 —— 有效的偏好一共几十条几百 token，全塞进 system prompt
       比任何检索都准，而且可解释。所以这里不做检索。
 
-  5.7 收窄接口 —— 给模型的是 log_meal(name, note) 这种参数化函数，
+  5.7 收窄接口 —— 给模型的是 log_event(category, kind, name) 这种参数化函数，
       不是 execute_sql()。它写不出你意料之外的查询，你也就不用猜数据
       是怎么变成那样的。
 
@@ -43,10 +43,29 @@ def _client() -> OpenAI:
     return _client_cache
 
 
+def _status_tag(r) -> str:
+    """给模型看的状态结论，不是两个字段让它自己拼。
+
+    "这条过期了没"是**渲染时现算**的，不落库 —— 所以不存在"上次判定和
+    下次判定之间的空窗"，那个问题只属于定时任务写库的方案。这里没有
+    "判定时刻"，只有"显示时刻"，而显示时刻永远是现在。
+
+    为什么不让模型自己比：那是拿今天的日期去减记录的日期，它会算错，
+    而且错了不报错（跟 5.6 的时区推论同一个道理）。
+    """
+    if r["status"] != "planned":
+        return ""
+    if r["ts"] < db.now():
+        return "  [⏰ 早就过了，还没确认做没做]"
+    return "  [计划中]"
+
+
 def _fmt_log(r) -> str:
-    return (f"id={r['id']}  {db.to_local(r['ts'])}  {r['kind']}  {r['name']}"
+    return (f"id={r['id']}  {db.to_local(r['ts'])}  {r['category']}/{r['kind']}"
+            f"  {r['name']}"
             + (f" @{r['place']}" if r["place"] else "")
-            + (f"（{r['note']}）" if r["note"] else ""))
+            + (f"（{r['note']}）" if r["note"] else "")
+            + _status_tag(r))
 
 
 # ---------- 地点：中心点要跟着对话走 ----------
@@ -139,44 +158,73 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "log_meal",
+            "name": "log_event",
             "description": (
-                "记录用户吃了什么。用户提到自己吃了/在吃某样东西时调用。"
-                "一句话里提到多样食物，就每样调用一次，不要合并成一条。"
+                "记录用户做了什么、或者将要做什么。"
+                "他提到吃了东西、提到接下来要做的事（明天考试、周五去某地、约了人）时调用。"
+                "一句话里提到几件事，就每件调用一次，不要合并成一条。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": list(db.CATEGORIES),
+                        "description": (
+                            "大分类，看有没有别人：和别人一起或约了别人就 appointment，"
+                            "只关自己就 personal。"
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": list(db.KINDS),
+                        "description": (
+                            "小分类，看是什么事。吃东西一律 meal（约人吃饭也是 meal，"
+                            "「和别人」那一维由 category 记）；考试上课复习 study；"
+                            "跑步健身打球 exercise；出差旅行 travel；看病吃药体检 health；"
+                            "买东西下单 purchase。"
+                            "判不准就填 other —— 绝不要造这个清单以外的新值。"
+                        ),
+                    },
                     # 这里刻意不给具体食物做示例：示例词会在上下文里被反复
                     # 强化，模型后面容易把它当默认值填进来。
                     "name": {
                         "type": "string",
                         "description": (
-                            "食物名称。只能取用户最新这一句话里明确提到的食物，"
-                            "绝不要沿用上一轮的名字。这一句里没有出现食物名称就不要调用本工具。"
+                            "这件事本身，短短几个字。只能取用户最新这一句话里明确提到的内容，"
+                            "绝不要沿用上一轮的名字。这一句里没有出现具体的事就不要调用本工具。"
+                            "kind=meal 时这里填食物名称，一句话提到多样食物就每样调用一次。"
                         ),
                     },
-                    "note": {"type": "string", "description": "用户对它的评价或补充。没有就不填"},
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "约了谁、具体要干什么、评价、补充，全写这里。"
+                            "这是事后唯一能想起细节的地方，用户说了就别丢。没有就不填。"
+                        ),
+                    },
                     "place": {
                         "type": "string",
                         "description": (
-                            "在哪家店吃的。用户提到了店名就填，在家做饭/没提就不填。"
-                            "只填店名本身，不要加「那家」「附近的」这类修饰词。"
+                            "这件事发生在哪儿。店名、医院、健身房、城市都行 —— "
+                            "用户说到什么粒度就填什么粒度，不要追问更细的，也不要自己补。"
+                            "只填地点本身，不要加「那家」「附近的」这类修饰词。没提就不填。"
                         ),
                     },
                     "ts": {
                         "type": "string",
                         "description": (
-                            "这顿饭发生的本地时间，形如 2026-08-10 15:00。"
-                            "用户提到了时间（昨天下午、今天早上、周三中午）就必须填；"
-                            "完全没提时间就不填，默认记成现在。"
+                            "这件事发生（或将要发生）的本地时间，形如 2026-08-10 15:00。"
+                            "**将来的事必须填**，不填会被当成已经发生了。"
+                            "用户提到了时间（昨天下午、明天早上、周三中午）就必须填；"
+                            "完全没提时间才不填，默认记成现在。"
                             "只说了时段没说几点，就用这套锚点："
                             "上午 09:00 / 中午 12:00 / 下午 15:00 / 晚上 19:00。"
                         ),
                     },
                 },
                 # ts 刻意不设 required：设了就等于逼模型给每顿饭编一个时间。
-                "required": ["name"],
+                "required": ["category", "kind", "name"],
             },
         },
     },
@@ -191,9 +239,27 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "description": "记录类型，饮食填 meal。不填就查全部"},
-                    "name": {"type": "string", "description": "按名称模糊匹配。不填就不按名称筛"},
-                    "days": {"type": "integer", "description": "往前看几天，默认 30。问'最近'用这个"},
+                    "kind": {
+                        "type": "string",
+                        "enum": list(db.KINDS),
+                        "description": "小分类。查饮食填 meal —— 推荐吃的地方之前必须带上它，不带会捞进考试和开会。不填就查全部",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": list(db.CATEGORIES),
+                        "description": "大分类。「我这周有什么约」用 appointment。不填就查全部",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": list(db.STATUSES),
+                        "description": "planned=还没做的，done=已经发生的。「我还有什么没干」用 planned。不填就查全部",
+                    },
+                    "place": {
+                        "type": "string",
+                        "description": "按地点找。「我去过某某餐厅吗」用这个，店名写全称或简称都行",
+                    },
+                    "name": {"type": "string", "description": "按名称模糊匹配（子串，不是语义：搜「面条」找不到「牛肉面」）。不填就不按名称筛"},
+                    "days": {"type": "integer", "description": "往前看几天，默认 30。问'最近'用这个。注意它只是下界，将来的事一直都在结果里"},
                     "since": {
                         "type": "string",
                         "description": (
@@ -213,8 +279,9 @@ TOOLS = [
         "function": {
             "name": "correct_log",
             "description": (
-                "更正一条已有记录的名称或备注。**必须先用 find_logs 查到 id**，"
-                "不要凭印象猜 id。执行前系统会向用户当面确认，用户拒绝就作罢。"
+                "更正一条已有记录。**必须先用 find_logs 查到 id**，不要凭印象猜 id。"
+                "用户说某件计划中的事做完了、取消了，也用它把 status 改掉。"
+                "执行前系统会向用户当面确认，用户拒绝就作罢。"
                 "没有删除记录的工具，用户要删就如实告诉他你做不到。"
             ),
             "parameters": {
@@ -225,9 +292,23 @@ TOOLS = [
                     "note": {"type": "string", "description": "改成的新备注。不改就不填"},
                     "ts": {
                         "type": "string",
-                        "description": "改成的新时间，本地格式如 2026-08-10 19:00。不改就不填",
+                        "description": (
+                            "改成的新时间，本地格式如 2026-08-10 19:00。不改就不填。"
+                            "注意改时间不会自动改状态 —— 如果那件事其实已经做了，"
+                            "要把 status 一起填成 done。"
+                        ),
                     },
-                    "place": {"type": "string", "description": "改成的新店名。不改就不填"},
+                    "place": {"type": "string", "description": "改成的新地点。不改就不填"},
+                    "category": {
+                        "type": "string",
+                        "enum": list(db.CATEGORIES),
+                        "description": "改成的新大分类。不改就不填",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": list(db.STATUSES),
+                        "description": "改成的新状态。用户说「那个我做了」就填 done。不改就不填",
+                    },
                 },
                 "required": ["id"],
             },
@@ -322,13 +403,17 @@ TOOLS = [
 
 def _run_tool(name: str, args: dict) -> str:
     """执行工具，返回给模型看的文本结果。"""
-    if name == "log_meal":
+    if name == "log_event":
         if err := _to_utc(args, "ts"):
             return err
-        row_id = db.log_meal(args["name"], note=args.get("note"), ts=args.get("ts"),
-                             place=args.get("place"))
-        # 回显必须带时间。模型能自己填 ts 了，它就会把"昨天下午"记成今天 ——
-        # 不当场打出来，这种错你要等到下次查记录才发现（设计文档 5.2）。
+        try:
+            row_id = db.log_event(args.get("category"), args.get("kind"), args["name"],
+                                  note=args.get("note"), ts=args.get("ts"),
+                                  place=args.get("place"))
+        except ValueError as e:
+            return _bad_vocab(e, args)
+        # 回显必须带时间和状态。模型能自己填 ts 了，它就会把"昨天下午"记成
+        # 今天 —— 不当场打出来，这种错你要等到下次查记录才发现（文档 5.2）。
         return f"已记录：{_fmt_log(db.get_log(row_id))}"
 
     if name == "find_logs":
@@ -336,7 +421,9 @@ def _run_tool(name: str, args: dict) -> str:
             return err
         rows = db.find_logs(kind=args.get("kind"), name=args.get("name"),
                             days=args.get("days", 30),
-                            since=args.get("since"), until=args.get("until"))
+                            since=args.get("since"), until=args.get("until"),
+                            category=args.get("category"), place=args.get("place"),
+                            status=args.get("status"))
         if not rows:
             return "没找到符合条件的记录。"
         return "\n".join(_fmt_log(r) for r in rows)
@@ -349,25 +436,35 @@ def _run_tool(name: str, args: dict) -> str:
         if err := _to_utc(args, "ts"):
             return err
 
-        changes = []
-        if args.get("name"):
-            changes.append(f"名称改成「{args['name']}」")
-        if args.get("note"):
-            changes.append(f"备注改成「{args['note']}」")
-        if args.get("ts"):
+        # ⚠️ 一律用 is not None，别用真假值。db.correct_log 那边判的就是
+        # is not None，两边看法不一致时空字符串会绕过确认框：模型传
+        # {"name": "", "note": "x"}，框里只说"备注改成 x"，但 name 也被
+        # 写成了空串 —— 一个没经过确认的字段被改掉了（README 已知问题）。
+        # 空串本身也挡掉："清空"该是显式操作，不该是省略参数的副作用。
+        edits = {k: args[k] for k in ("name", "note", "ts", "place",
+                                      "category", "status")
+                 if args.get(k) is not None}
+        if any(v == "" for v in edits.values()):
+            return "不接受空字符串。要清空某个字段就明说，别传空串。"
+
+        labels = {"name": "名称", "note": "备注", "ts": "时间", "place": "地点",
+                  "category": "大分类", "status": "状态"}
+        changes = [
             # 确认框里说的是本地时间 —— 给人看的东西不该出现 UTC
-            changes.append(f"时间改成「{db.to_local(args['ts'])}」")
-        if args.get("place"):
-            changes.append(f"地点改成「{args['place']}」")
+            f"{labels[k]}改成「{db.to_local(v) if k == 'ts' else v}」"
+            for k, v in edits.items()
+        ]
         if not changes:
-            return "没说要改什么，name / note / ts / place 至少给一个。"
+            return f"没说要改什么，{' / '.join(labels)} 至少给一个。"
 
         if not ui.confirm(f"要把这条{'，'.join(changes)}吗？", _fmt_log(old)):
             # 把拒绝如实告诉模型，让它知道这次没生效，别接着往下假设。
             return "用户拒绝了这次改动，记录没有变。"
 
-        db.correct_log(row_id, name=args.get("name"), note=args.get("note"),
-                       ts=args.get("ts"), place=args.get("place"))
+        try:
+            db.correct_log(row_id, **edits)
+        except ValueError as e:
+            return _bad_vocab(e, args)
         return f"已更正：{_fmt_log(db.get_log(row_id))}"
 
     if name == "remember":
@@ -380,23 +477,63 @@ def _run_tool(name: str, args: dict) -> str:
     return f"没有这个工具：{name}"
 
 
+def _bad_vocab(err: ValueError, args: dict) -> str:
+    """分类填错了：告诉模型重填，同时把这次失败落账。
+
+    跟 _to_utc 一个路子 —— 参数填错不是程序坏了，抛异常会打断整场对话，
+    给它一句人话让它重填就行。
+
+    落账是为了以后能回答"到底是模型笨还是词表定错了"。这一条天天出现，
+    说明该改的是词表（文档 12.1：没有账本就没有优化）。
+    """
+    db.record_event("cli", "bad_vocab", {
+        "error": str(err),
+        "category": args.get("category"), "kind": args.get("kind"),
+        "status": args.get("status"),
+    })
+    return (f"{err} 从清单里挑一个重填，不要造新值；"
+            f"判不准就用 other。别把这个错误告诉用户，直接重试。")
+
+
 def _been_there(store: str) -> str:
-    """这家店用户去过没有。空字符串表示没记录。
+    """这个地方用户去过没有 / 约了要去没有。空字符串表示一条记录都没有。
 
     这一行就是整个推荐功能的支点：高德能说出附近有什么，但"这家你去过两次、
     上次说排队久但值"只有 logs 有。设计文档 7.5 说的、赢得过美团的唯一原因
     就是这一条 —— 所以候选集里每一家都要过一遍这个函数。
+
+    它是**那个 join**：高德返回一批店，status 在 logs 里，总得有段代码把
+    两边接起来。不能让模型自己一家一家去 find_logs —— 那是二十次工具调用。
+
+    "去过"和"约了要去"直接按 status 分组，不做任何时间判断：status 存的
+    就是这件事发生了没有，再拿时间戳猜一遍纯属多此一举，还会猜错 ——
+    改之前它拿 rows[0] 当"最近一次"，而未来的计划排序在最前，
+    于是"下周约了要去"会被报成"你去过1次"。
     """
     rows = db.place_history(store)
     if not rows:
         return ""
-    last = rows[0]
-    out = f"你去过{len(rows)}次，最近 {db.to_local(last['ts'])}"
-    if last["name"]:
-        out += f"吃的{last['name']}"
-    if last["note"]:
-        out += f"，你说「{last['note']}」"
-    return out
+
+    done = [r for r in rows if r["status"] == "done"]
+    planned = [r for r in rows if r["status"] == "planned"]
+
+    parts = []
+    if done:
+        last = done[0]
+        bit = f"你去过{len(done)}次，最近 {db.to_local(last['ts'])}"
+        if last["name"]:
+            # kind 不是 meal 时别说成"吃的"——在咖啡馆学习也会记 place
+            bit += f"{'吃的' if last['kind'] == 'meal' else '：'}{last['name']}"
+        if last["note"]:
+            bit += f"，你说「{last['note']}」"
+        parts.append(bit)
+    for r in planned:
+        when = db.to_local(r["ts"])
+        if r["ts"] < db.now():
+            parts.append(f"你 {when} 约了要去，那天已经过了 —— 去没去？")
+        else:
+            parts.append(f"{when} 还约了要去")
+    return "；".join(parts)
 
 
 def _run_place_tool(name: str, args: dict) -> str:
@@ -470,9 +607,12 @@ def _run_place_tool(name: str, args: dict) -> str:
 def system_prompt() -> str:
     lines = [
         "你是 cadence，一个只服务于一个人的私人助手。说话简短、直接，不用客服腔，不要每句都确认。",
-        "用户提到吃了什么就调 log_meal 记下来，不用问他要不要记。",
+        "用户提到吃了什么、或者接下来要做什么（明天考试、周五去某地、约了人），"
+        "就调 log_event 记下来，时间、地点、细节都填进去，不用问他要不要记。",
+        "看见记录标着「早就过了，还没确认做没做」，可以顺口问一句做了没；"
+        "他说做了就用 correct_log 把 status 改成 done。",
         "用户说之前哪条记错了，先用 find_logs 查出来复述给他，确认是哪一条之后再用 correct_log。",
-        "推荐吃的地方之前，先用 find_logs 看他最近吃了什么，别推他刚吃过的。",
+        "推荐吃的地方之前，先用 find_logs(kind=\"meal\") 看他最近吃了什么，别推他刚吃过的。",
         "find_places 的结果里标了「你去过N次」的，一定要把去过几次、上次说了什么讲出来 ——"
         "这是他自己的记录，比评分有用得多。没标的就是没去过，别编成去过。",
         "用户没说想吃什么就先调 list_place_types，拿着这一带真实有的菜系给他两三个具体方向，"
