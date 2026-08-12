@@ -14,6 +14,7 @@
 """
 
 import json
+import re
 from datetime import datetime
 
 from openai import OpenAI
@@ -160,8 +161,10 @@ TOOLS = [
         "function": {
             "name": "log_event",
             "description": (
-                "记录用户做了什么、或者将要做什么。"
-                "他提到吃了东西、提到接下来要做的事（明天考试、周五去某地、约了人）时调用。"
+                "记录用户做了什么、正在做什么、或者将要做什么。"
+                "他提到吃了东西、提到已经发生过的事、提到接下来要做的事时都调用。"
+                "**没做成的事也要记**：约了人没去成、计划了但取消了、"
+                "本来要做结果加班了——这些照样是发生过的事，而且正是以后回顾时最有用的。"
                 "一句话里提到几件事，就每件调用一次，不要合并成一条。"
             ),
             "parameters": {
@@ -192,7 +195,9 @@ TOOLS = [
                         "type": "string",
                         "description": (
                             "这件事本身，短短几个字。只能取用户最新这一句话里明确提到的内容，"
-                            "绝不要沿用上一轮的名字。这一句里没有出现具体的事就不要调用本工具。"
+                            "绝不要沿用上一轮的名字。"
+                            "只有当这一句纯粹是闲聊或提问、没提到任何具体的事时，才不要调用本工具——"
+                            "事情没做成不算「没有事」，那也是一件事，要记。"
                             "kind=meal 时这里填食物名称，一句话提到多样食物就每样调用一次。"
                         ),
                     },
@@ -258,7 +263,15 @@ TOOLS = [
                         "type": "string",
                         "description": "按地点找。「我去过某某餐厅吗」用这个，店名写全称或简称都行",
                     },
-                    "name": {"type": "string", "description": "按名称模糊匹配（子串，不是语义：搜「面条」找不到「牛肉面」）。不填就不按名称筛"},
+                    "keyword": {
+                        "type": "string",
+                        "description": (
+                            "关键词，同时在名称、备注、地点三处里找。"
+                            "**问到某个人（老王、张姐）时一定用它** —— 人名通常写在备注里。"
+                            "是子串匹配不是语义匹配：搜「面条」找不到「牛肉面」，搜「面」可以。"
+                            "查出来条数少得可疑就别下结论，去掉 keyword 用 kind 或 category 重查一次。"
+                        ),
+                    },
                     "days": {"type": "integer", "description": "往前看几天，默认 30。问'最近'用这个。注意它只是下界，将来的事一直都在结果里"},
                     "since": {
                         "type": "string",
@@ -419,7 +432,7 @@ def _run_tool(name: str, args: dict) -> str:
     if name == "find_logs":
         if err := _to_utc(args, "since", "until"):
             return err
-        rows = db.find_logs(kind=args.get("kind"), name=args.get("name"),
+        rows = db.find_logs(kind=args.get("kind"), keyword=args.get("keyword"),
                             days=args.get("days", 30),
                             since=args.get("since"), until=args.get("until"),
                             category=args.get("category"), place=args.get("place"),
@@ -475,6 +488,51 @@ def _run_tool(name: str, args: dict) -> str:
         return _run_place_tool(name, args)
 
     return f"没有这个工具：{name}"
+
+
+# 模型爱把日期当字面量写：{"ts": 2026-08-07 19:00}，少了引号就不是合法 JSON。
+# 实测同一句话连试三次全栽在这里，不是偶发抖动，是一个稳定的模型行为。
+_NAKED_TS = re.compile(r':\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)\s*(?=[,}])')
+
+
+def _parse_args(raw: str | None) -> tuple[dict, str]:
+    """解析模型给的工具参数。返回 (参数, 出错时给模型看的话)。
+
+    这里是**交界处**（设计文档 12.2：故障出现在模块交界处，所以契约要写在
+    交界处）。改之前这里是一句裸的 json.loads —— 模型吐一个畸形 JSON，
+    异常直接冒泡，整轮工具调用全废。chat.py 外面那层 try 只能兜住不退出，
+    兜不住"这一轮什么都没干成"。
+
+    两层处理，顺序不能反：
+
+    1. **窄修补**：只补日期缺的那对引号。意图完全无歧义（`2026-08-07 19:00`
+       不可能是别的东西），而且这个畸形是稳定复现的。修补要**打印 + 落库**，
+       不许静默 —— 悄悄改模型的输出是条滑坡，能修的前提是看得见修了什么。
+    2. **修不好就如实退回**，并且**说清楚错在哪一个字段**。只说"JSON 不合法"
+       它多半会原样再来一遍；指名道姓说"ts 少了引号"，它才改得掉。
+    """
+    raw = raw or "{}"
+    try:
+        return json.loads(raw), ""
+    except json.JSONDecodeError:
+        pass
+
+    fixed = _NAKED_TS.sub(r': "\1"', raw)
+    if fixed != raw:
+        try:
+            args = json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+        else:
+            print("  ⚠ 模型的日期没加引号，已自动补上（原样已记进 events）")
+            db.record_event("cli", "json_repair", {"raw": raw, "fixed": fixed})
+            return args, ""
+
+    db.record_event("cli", "bad_json", {"raw": raw})
+    return {}, ("你给的参数不是合法 JSON，这次调用没执行。"
+                "常见原因：日期这类值必须用双引号包成字符串，"
+                '写成 "ts": "2026-08-07 19:00"，不能写成 "ts": 2026-08-07 19:00。'
+                "检查一遍引号再调一次。")
 
 
 def _bad_vocab(err: ValueError, args: dict) -> str:
@@ -607,11 +665,18 @@ def _run_place_tool(name: str, args: dict) -> str:
 def system_prompt() -> str:
     lines = [
         "你是 cadence，一个只服务于一个人的私人助手。说话简短、直接，不用客服腔，不要每句都确认。",
-        "用户提到吃了什么、或者接下来要做什么（明天考试、周五去某地、约了人），"
-        "就调 log_event 记下来，时间、地点、细节都填进去，不用问他要不要记。",
+        "用户提到吃了什么、发生过什么事、接下来要做什么，就调 log_event 记下来，"
+        "时间、地点、跟谁、细节都填进去，不用问他要不要记。"
+        "**没做成的事同样要记**（约了没去成、计划了又取消），那是新的一条记录，不是更正。",
         "看见记录标着「早就过了，还没确认做没做」，可以顺口问一句做了没；"
         "他说做了就用 correct_log 把 status 改成 done。",
-        "用户说之前哪条记错了，先用 find_logs 查出来复述给他，确认是哪一条之后再用 correct_log。",
+        "用户提到某个人（名字、「我朋友」「同事」），先用 find_logs 的 keyword 查一遍这个人 ——"
+        "人名多半写在备注里，keyword 三列一起搜才找得到。"
+        "查到过往有值得提的（放过他鸽子、上次很尽兴、老是迟到），**主动说出来**，别等他问。"
+        "这是他自己的记录，是这个助手唯一比搜索引擎强的地方。",
+        "只有当用户明确指向一条已有记录时（「那条记错了」「上次你记的不对」），"
+        "才先用 find_logs 查出来复述、再 correct_log。"
+        "他只是在讲一件事，哪怕这件事没办成，也一律是 log_event 新记一条。",
         "推荐吃的地方之前，先用 find_logs(kind=\"meal\") 看他最近吃了什么，别推他刚吃过的。",
         "find_places 的结果里标了「你去过N次」的，一定要把去过几次、上次说了什么讲出来 ——"
         "这是他自己的记录，比评分有用得多。没标的就是没去过，别编成去过。",
@@ -672,7 +737,10 @@ def chat(messages: list[dict], verbose: bool = True) -> str:
         })
 
         for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments or "{}")
+            args, err = _parse_args(tc.function.arguments)
+            if err:
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": err})
+                continue
             # 先打印再执行，两个原因：确认框在 _run_tool 里弹，你得先看见
             # 它要干什么再被问；而且 _to_utc 会就地把本地时间换成 UTC，
             # 打印晚了就看不到模型原本填的是什么了 —— 这行的全部意义

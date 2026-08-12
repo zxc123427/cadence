@@ -329,7 +329,7 @@ def remember(category: str, key: str, value: str,
 
 # ---------- 窄接口：读 ----------
 
-def find_logs(kind: str | None = None, name: str | None = None, days: int = 30,
+def find_logs(kind: str | None = None, keyword: str | None = None, days: int = 30,
               since: str | None = None, until: str | None = None,
               category: str | None = None, place: str | None = None,
               status: str | None = None) -> list[sqlite3.Row]:
@@ -349,7 +349,9 @@ def find_logs(kind: str | None = None, name: str | None = None, days: int = 30,
     否则问"最近有什么"会漏掉明天的考试。别当 bug 改掉。
     要排除未来的，用 until，或者 status="done"。
 
-    place 用双向包含匹配，见下面的注释。
+    keyword 同时搜 name / note / place 三列 —— 找"跟老王""排队""泾县"
+    这种散落在自由文本里的东西全靠它。place 参数是另一回事，
+    它用双向包含专门给高德的店名对齐用，见下面的注释。
     """
     # 区间的值来自模型，必须校验。ts 是 TEXT 列，格式不对的字符串
     # 比较不会报错，只会安静地给出错误结果 —— 那种 bug 最难查。
@@ -383,9 +385,18 @@ def find_logs(kind: str | None = None, name: str | None = None, days: int = 30,
     if status:
         where.append("status = ?")
         params.append(status)
-    if name:
-        where.append("name LIKE ?")
-        params.append(f"%{name}%")
+    if keyword and keyword.strip():
+        # 三列一起搜，因为**人名几乎只存在于 note 里**。
+        # 实测：库里四条跟老王有关的记录，name 列写的是"健身房""打羽毛球"
+        # "徒步"，只有一条含"老王"。当初这个参数只搜 name，于是
+        # find_logs(name=老王) 返回一条，模型就回答"你只跟他出去过一次"——
+        # 把有的说成没有，比编造更难发现，因为它听起来很守规矩。
+        #
+        # 参数从 name 改名成 keyword 是必须的：它现在搜三列，
+        # 还叫 name 就是在撒谎，而撒谎的参数名会让下一个人（和模型）用错。
+        kw = f"%{keyword.strip()}%"
+        where.append("(name LIKE ? OR note LIKE ? OR place LIKE ?)")
+        params += [kw, kw, kw]
     if place and place.strip():
         # ⚠️ 双向包含，因为两边的名字粒度对不上：库里存的是你随口说的
         # 「随园餐厅」，高德给的是「随园餐厅(仙鹤门店)」。

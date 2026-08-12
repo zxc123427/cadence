@@ -235,10 +235,53 @@ ok("双向包含：「随园别院」不该命中",
 ok("kind=meal 不会混进 study / travel",
    all(r["kind"] == "meal" for r in db.find_logs(kind="meal", days=3650)))
 
+# keyword 必须三列一起搜。第三批实测：库里五条跟"老王"有关的记录，
+# name 列写的是"健身房""打羽毛球""徒步"，只有一条含"老王" ——
+# 当初这个参数只搜 name，模型查一次拿到一条，就回答"你只跟他出去过一次"。
+db.log_event("appointment", "exercise", "健身房", note="跟老王一起去的", ts=utc(timedelta(days=-3)))
+db.log_event("appointment", "travel", "徒步", note="跟老王去的", ts=utc(timedelta(days=3)))
+db.log_event("personal", "meal", "牛肉面", note="有点咸", place="老王面馆",
+             ts=utc(timedelta(days=-1)))
+ok("keyword 搜 name 列", len(db.find_logs(keyword="徒步", days=3650)) == 1)
+ok("keyword 搜 note 列（人名几乎只存在于这里）",
+   len(db.find_logs(keyword="老王", days=3650)) == 3,
+   f"只拿到 {len(db.find_logs(keyword='老王', days=3650))} 条")
+ok("keyword 搜 place 列", any(r["place"] == "老王面馆"
+                             for r in db.find_logs(keyword="面馆", days=3650)))
+ok("keyword 是子串不是语义：搜「面条」找不到「牛肉面」",
+   len(db.find_logs(keyword="面条", days=3650)) == 0)
+ok("keyword 空串不当条件用（否则一查全中）",
+   len(db.find_logs(keyword="  ", days=3650)) == len(db.find_logs(days=3650)))
+
 ok("place_history 委托给 find_logs，结果一致",
    [r["id"] for r in db.place_history("随园餐厅")]
    == [r["id"] for r in db.find_logs(place="随园餐厅", days=3650)])
 ok("place_history 空串返回空", db.place_history("  ") == [])
+
+
+# ---------- 4.5 工具参数的契约 ----------
+#
+# 交界处必须有契约（文档 12.2）。这里改之前是一句裸的 json.loads —— 模型
+# 吐一个畸形 JSON，异常直接冒泡，整轮工具调用全废。而它吐畸形不是偶发：
+# 实测同一句话连试三次，三次都把日期写成了没引号的字面量。
+
+print("\n工具参数的契约")
+
+import llm as _llm  # noqa: E402
+
+a, e = _llm._parse_args('{"kind": "meal", "name": "x"}')
+ok("正常 JSON 照常解析", a == {"kind": "meal", "name": "x"} and not e)
+
+a, e = _llm._parse_args('{"name": "看话剧", "ts": 2026-08-07 19:00}')
+ok("日期少引号能补上（模型的稳定畸形）",
+   a.get("ts") == "2026-08-07 19:00" and not e, f"拿到 {a}, {e}")
+
+a, e = _llm._parse_args('{"note": "他说"来不了""}')
+ok("补不了的如实退回，不抛异常", a == {} and "不是合法 JSON" in e)
+ok("退回的话要指名道姓说错在哪", "ts" in e and "引号" in e)
+
+a, e = _llm._parse_args(None)
+ok("参数为空当成空字典", a == {} and not e)
 
 
 # ---------- 5. 渲染 ----------
