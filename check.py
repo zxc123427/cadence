@@ -110,7 +110,7 @@ conn.close()
 
 db.connect().close()                                        # ← 真正的升级发生在这里
 
-after = db.find_logs(days=3650)
+after, _ = db.find_logs(days=3650)
 ok("老库升级后行数不变", len(after) == 3, f"变成了 {len(after)} 行")
 
 by_id = {r["id"]: r for r in after}
@@ -127,7 +127,7 @@ ok("老行的 category 回填成 personal", all(r["category"] == "personal" for 
 cols_migrated = columns(db.DB_PATH)
 db.connect().close()                                        # 再跑一次
 ok("_migrate 幂等（连跑两次列不变）", columns(db.DB_PATH) == cols_migrated)
-ok("连跑两次数据不变", len(db.find_logs(days=3650)) == 3)
+ok("连跑两次数据不变", db.find_logs(days=3650)[1] == 3)
 
 # 新建库 vs 升级库：两条路必须造出一模一样的表。
 # SCHEMA 和 NEW_COLUMNS 是两处写法，漂了就会出现"新装的机器和老机器不一样"，
@@ -155,12 +155,12 @@ raises("空 kind 报错", db.log_event, "personal", "", "x")
 raises("None kind 报错", db.log_event, "personal", None, "x")
 raises("空 category 报错", db.log_event, "", "meal", "x")
 
-n_before = len(db.find_logs(days=3650))
+n_before = db.find_logs(days=3650)[1]
 try:
     db.log_event("personal", "exam", "不该落库")
 except ValueError:
     pass
-ok("非法值不留半条脏数据", len(db.find_logs(days=3650)) == n_before)
+ok("非法值不留半条脏数据", db.find_logs(days=3650)[1] == n_before)
 
 rid = db.log_event("PERSONAL", " Meal ", "大小写和空格")
 row = db.get_log(rid)
@@ -211,29 +211,29 @@ far = db.log_event("appointment", "travel", "去宣城找朋友",
                    ts=utc(timedelta(days=90)), place="宣城",
                    note="租车带我去泾县转一转")
 
-got = db.find_logs(days=1)
+got, _ = db.find_logs(days=1)
 ok("days 只是下界：三个月后的记录也在结果里", any(r["id"] == far for r in got))
 
-got = db.find_logs(until=utc(timedelta(days=-1)))
+got, _ = db.find_logs(until=utc(timedelta(days=-1)))
 ok("until 能排除未来的记录", not any(r["id"] == far for r in got))
 
-got = db.find_logs(category="appointment", kind="travel",
+got, _ = db.find_logs(category="appointment", kind="travel",
                    status="planned", place="宣城", days=3650)
 ok("四个条件同时给，结果正确",
    [r["id"] for r in got] == [far], f"拿到 {[r['id'] for r in got]}")
 
-got = db.find_logs(place="随园", days=3650)
+got, _ = db.find_logs(place="随园", days=3650)
 ok("place 为空的记录不参与匹配（没有 place != '' 就会全中）",
    all(r["place"] for r in got) and len(got) == 1,
    f"拿到 {[(r['id'], r['place']) for r in got]}")
 
 ok("双向包含：库存「随园餐厅」，查高德的长名字能命中",
-   len(db.find_logs(place="随园餐厅(仙鹤门店)", days=3650)) == 1)
+   db.find_logs(place="随园餐厅(仙鹤门店)", days=3650)[1] == 1)
 ok("双向包含：「随园别院」不该命中",
-   len(db.find_logs(place="随园别院", days=3650)) == 0)
+   db.find_logs(place="随园别院", days=3650)[1] == 0)
 
 ok("kind=meal 不会混进 study / travel",
-   all(r["kind"] == "meal" for r in db.find_logs(kind="meal", days=3650)))
+   all(r["kind"] == "meal" for r in db.find_logs(kind="meal", days=3650)[0]))
 
 # keyword 必须三列一起搜。第三批实测：库里五条跟"老王"有关的记录，
 # name 列写的是"健身房""打羽毛球""徒步"，只有一条含"老王" ——
@@ -242,20 +242,45 @@ db.log_event("appointment", "exercise", "健身房", note="跟老王一起去的
 db.log_event("appointment", "travel", "徒步", note="跟老王去的", ts=utc(timedelta(days=3)))
 db.log_event("personal", "meal", "牛肉面", note="有点咸", place="老王面馆",
              ts=utc(timedelta(days=-1)))
-ok("keyword 搜 name 列", len(db.find_logs(keyword="徒步", days=3650)) == 1)
+ok("keyword 搜 name 列", db.find_logs(keyword="徒步", days=3650)[1] == 1)
 ok("keyword 搜 note 列（人名几乎只存在于这里）",
-   len(db.find_logs(keyword="老王", days=3650)) == 3,
-   f"只拿到 {len(db.find_logs(keyword='老王', days=3650))} 条")
+   db.find_logs(keyword="老王", days=3650)[1] == 3,
+   f"只拿到 {db.find_logs(keyword='老王', days=3650)[1]} 条")
 ok("keyword 搜 place 列", any(r["place"] == "老王面馆"
-                             for r in db.find_logs(keyword="面馆", days=3650)))
+                             for r in db.find_logs(keyword="面馆", days=3650)[0]))
 ok("keyword 是子串不是语义：搜「面条」找不到「牛肉面」",
-   len(db.find_logs(keyword="面条", days=3650)) == 0)
+   db.find_logs(keyword="面条", days=3650)[1] == 0)
 ok("keyword 空串不当条件用（否则一查全中）",
-   len(db.find_logs(keyword="  ", days=3650)) == len(db.find_logs(days=3650)))
+   db.find_logs(keyword="  ", days=3650)[1] == db.find_logs(days=3650)[1])
+
+# 时间窗的默认值取决于有没有关键词。关键词本身就是筛子，所以搜全库不心疼；
+# 会失控的是没有关键词的全量查询，那种才需要时间窗兜着。
+# 不这么做的后果实测过：模型调 find_logs(keyword=小明) 不带 days，
+# 一年后会漏掉三十天以前的全部，还照样给出一个自信的结论。
+old = db.log_event("appointment", "meal", "两年前跟老王吃的饭",
+                   note="跟老王", ts=utc(timedelta(days=-730)))
+ok("给了 keyword 就不加时间下界（两年前的记录搜得到）",
+   any(r["id"] == old for r in db.find_logs(keyword="老王")[0]),
+   "默认值规则没生效，keyword 查询被 30 天窗口截住了")
+ok("给了 place 同样不加时间下界",
+   db.find_logs(place="随园餐厅")[1] == 1)
+ok("没给关键词时仍然只看最近 30 天",
+   not any(r["id"] == old for r in db.find_logs()[0]))
+ok("模型显式传了 days 就以它为准，默认值不许顶掉",
+   not any(r["id"] == old for r in db.find_logs(keyword="老王", days=7)[0]))
+
+# 截断必须让调用方知道。只截不说，模型会拿一个残缺集合下结论 ——
+# 那正是实测过的"查到一条就回答只有这一次"的翻版。
+for i in range(70):
+    db.log_event("personal", "other", f"批量{i}", ts=utc(timedelta(days=-i - 1)))
+rows, total = db.find_logs(keyword="批量")
+ok("超过上限时按 limit 截断", len(rows) == db.FIND_LIMIT, f"回了 {len(rows)} 行")
+ok("返回的总数是真实总数，不是截断后的长度", total == 70, f"总数报了 {total}")
+ok("limit 可以显式放宽", len(db.find_logs(keyword="批量", limit=100)[0]) == 70)
 
 ok("place_history 委托给 find_logs，结果一致",
    [r["id"] for r in db.place_history("随园餐厅")]
-   == [r["id"] for r in db.find_logs(place="随园餐厅", days=3650)])
+   == [r["id"] for r in db.find_logs(place="随园餐厅", days=3650)[0]])
 ok("place_history 空串返回空", db.place_history("  ") == [])
 
 
@@ -282,6 +307,38 @@ ok("退回的话要指名道姓说错在哪", "ts" in e and "引号" in e)
 
 a, e = _llm._parse_args(None)
 ok("参数为空当成空字典", a == {} and not e)
+
+
+# ---------- 4.6 回合内去重 ----------
+#
+# 实测两次同一个模式：模型 find_logs 看见了 id=38「看车展」，下一圈还是
+# log_event 又写了一条。它越常被问起的事越容易记重，而重复记录会污染
+# 后面所有的统计（"我跟老王出去过几次"会多算）。
+
+print("\n回合内去重")
+
+fresh_db()
+existing = db.log_event("appointment", "travel", "看车展",
+                        note="小明说带我去", ts=utc(timedelta(days=2)))
+
+# 模拟一个回合：先 find_logs（会往 seen 里登记），再 log_event（该被拦）
+seen: dict[str, int] = {}
+_llm._run_tool("find_logs", {"keyword": "看车展"}, seen)
+ok("find_logs 会把查到的记录登记进 seen", seen.get("看车展") == existing, str(seen))
+
+n0 = db.find_logs(days=3650)[1]
+out = _llm._run_tool("log_event", {"category": "appointment", "kind": "travel",
+                                   "name": "看车展"}, seen)
+ok("同一回合里再记同名 → 拦下，一行都不写", db.find_logs(days=3650)[1] == n0)
+ok("拦下时要告诉模型是哪一条、该怎么办",
+   str(existing) in out and "correct_log" in out, out)
+
+# 换一个回合 = 换一个 seen。同一天吃两次牛肉面是合法的，不能靠"同名同日"硬拦
+n1 = db.find_logs(days=3650)[1]
+_llm._run_tool("log_event", {"category": "appointment", "kind": "travel",
+                             "name": "看车展"}, {})
+ok("跨回合的同名记录照常写得进（别误伤「同一天吃两次牛肉面」）",
+   db.find_logs(days=3650)[1] == n1 + 1)
 
 
 # ---------- 5. 渲染 ----------
@@ -321,7 +378,7 @@ ok("一条记录都没有：返回空串，不留光秃秃的箭头", llm._been_
 ok("CLI 版 history_note 同样不会把 planned 说成去过",
    "去过" not in places.history_note("新店"))
 
-rows = {r["name"]: r for r in db.find_logs(days=3650)}
+rows = {r["name"]: r for r in db.find_logs(days=3650)[0]}
 ok("_fmt_log 给未来的事标 [计划中]", "[计划中]" in llm._fmt_log(rows["和张三吃饭"]))
 ok("_fmt_log 给过期未确认的标 [⏰ 早就过了]",
    "早就过了" in llm._fmt_log(rows["约了健身"]))

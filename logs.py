@@ -63,13 +63,14 @@ def main() -> None:
     if args.delete is not None:
         return do_delete(args.delete)
 
-    rows = db.find_logs(days=args.days, kind=args.kind, category=args.category,
-                        status=args.status, place=args.place)
+    rows, total = db.find_logs(days=args.days, kind=args.kind, category=args.category,
+                               status=args.status, place=args.place)
     if not rows:
         print(f"最近 {args.days} 天没有符合条件的记录。用 log_meal.py 记一条试试。")
         return
 
-    print(f"最近 {args.days} 天，{len(rows)} 条记录：\n")
+    more = f"（共 {total} 条，只显示最近 {len(rows)} 条）" if total > len(rows) else ""
+    print(f"最近 {args.days} 天，{len(rows)} 条记录{more}：\n")
     for r in rows:
         # 带上 id：删除和更正都要靠它定位
         print(fmt(r))

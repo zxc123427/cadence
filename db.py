@@ -329,20 +329,53 @@ def remember(category: str, key: str, value: str,
 
 # ---------- 窄接口：读 ----------
 
-def find_logs(kind: str | None = None, keyword: str | None = None, days: int = 30,
+# 一次检索最多回多少条。这是熔断，不是筛选（文档 12.1）——
+# _fmt_log 实测 29 token/条，60 条约 1.7K，塞进 64K 的上下文里安全。
+# 比 find_places 的 40 放宽，是因为"有没有谁老放我鸽子"这类聚合题
+# 需要看到全部的约（实测那次是 26 条）。
+FIND_LIMIT = 60
+
+
+def find_logs(kind: str | None = None, keyword: str | None = None,
+              days: int | None = None,
               since: str | None = None, until: str | None = None,
               category: str | None = None, place: str | None = None,
-              status: str | None = None) -> list[sqlite3.Row]:
-    """按条件找记录。返回的行带 id —— 更正和删除都要靠 id 定位。
+              status: str | None = None,
+              limit: int = FIND_LIMIT) -> tuple[list[sqlite3.Row], int]:
+    """按条件找记录，返回 (最多 limit 行, 符合条件的真实总数)。
 
-    为什么不直接按名字改删：名字会重复。"牛肉面"你可能吃过三次，
-    按名字动手会一次改掉三条。所以这些条件只负责「找到」，
-    真正动手的依据永远是 id。
+    行带 id —— 更正和删除都要靠 id 定位。为什么不直接按名字改删：
+    名字会重复。"牛肉面"你可能吃过三次，按名字动手会一次改掉三条。
+    所以这些条件只负责「找到」，真正动手的依据永远是 id。
 
-    时间有两种问法，共用同一个查询：
+    ⚠️ **总数必须跟着行一起返回。** 只截断不告诉调用方，模型就会拿着
+    一个残缺的集合下结论 —— 那正是实测过的"把有的说成没有"
+    （查到一条就回答"你只跟他出去过一次"，其实有五条）。
+
+    时间有三种问法：
       days              —— "最近几天"，单边下界，粗筛用
       since / until     —— 一个区间，"今天中午"这种具体时段用（UTC ISO）
-    给了 since 或 until 就按区间走，days 作废。两个都不给才回到 days。
+      都不给            —— 见下面 days 的默认值规则
+
+    给了 since 或 until 就按区间走，days 作废。
+
+    **days 不传时的默认值取决于有没有关键词**，这是刻意的：
+
+      给了 keyword 或 place  →  不限时间，搜全库
+      两个都没给             →  最近 30 天
+
+    因为**关键词本身就是筛子**。"小明这人靠谱吗"要看的是这辈子，
+    不是最近三十天 —— 实测模型调的就是 find_logs(keyword=小明) 不带 days，
+    现在数据都是新的所以全中，一年后会漏掉三十天以前的全部，
+    而且照样给出一个自信的结论。会失控的是**没有关键词**的全量查询，
+    那种才需要时间窗兜着。
+
+    搜全库不心疼：实测 5 万行三列 LIKE 只要 6–26 毫秒，全表扫描
+    十年内都不是瓶颈。贵的从来不是查，是回填进 prompt 的条数，
+    而那个由 limit 兜住了。
+
+    ⚠️ 这条规则必须写在代码里当默认值，不能写成提示词让模型"记得传
+    days=3650" —— 提示词不是闸门（文档 6.1）。
 
     ⚠️ **days 只是下界**（ts >= days_ago(n)），没有上界，所以将来的事
     永远包含在结果里。这是刻意的：计划中的事就该出现在"最近"里，
@@ -353,6 +386,9 @@ def find_logs(kind: str | None = None, keyword: str | None = None, days: int = 3
     这种散落在自由文本里的东西全靠它。place 参数是另一回事，
     它用双向包含专门给高德的店名对齐用，见下面的注释。
     """
+    if days is None and since is None and until is None:
+        narrowed = bool((keyword or "").strip()) or bool((place or "").strip())
+        days = None if narrowed else 30
     # 区间的值来自模型，必须校验。ts 是 TEXT 列，格式不对的字符串
     # 比较不会报错，只会安静地给出错误结果 —— 那种 bug 最难查。
     for label, v in (("since", since), ("until", until)):
@@ -367,8 +403,9 @@ def find_logs(kind: str | None = None, keyword: str | None = None, days: int = 3
     where: list[str] = []
     params: list = []
     if since is None and until is None:
-        where.append("ts >= ?")
-        params.append(days_ago(days))
+        if days is not None:            # days=None 就是"不限时间，搜全库"
+            where.append("ts >= ?")
+            params.append(days_ago(days))
     else:
         if since is not None:
             where.append("ts >= ?")
@@ -408,11 +445,20 @@ def find_logs(kind: str | None = None, keyword: str | None = None, days: int = 3
                      " AND (? LIKE '%' || place || '%' OR place LIKE ?)")
         params += [place.strip(), f"%{place.strip()}%"]
 
+    # 一个条件都没有时 where 是空的，' AND '.join([]) 会拼出
+    # "WHERE " 这种语法错误。用恒真兜住，别让它变成一个偶发的崩溃。
+    cond = " AND ".join(where) if where else "1=1"
+
     with connect() as conn:
-        return conn.execute(
-            f"SELECT * FROM logs WHERE {' AND '.join(where)} ORDER BY ts DESC",
-            params,
+        # 总数单独查一次。SELECT * 之后在 Python 里数长度是不行的 ——
+        # 那样数到的是截断后的条数，等于自己骗自己。
+        total = conn.execute(
+            f"SELECT count(*) FROM logs WHERE {cond}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM logs WHERE {cond} ORDER BY ts DESC LIMIT ?",
+            [*params, limit],
         ).fetchall()
+    return rows, total
 
 
 def get_log(row_id: int) -> sqlite3.Row | None:
@@ -428,14 +474,18 @@ def place_history(place: str) -> list[sqlite3.Row]:
     唯一原因就是这一条。
 
     只是 find_logs 的一个壳子 —— 双向包含的匹配规则**只该有一份**，
-    散成两处早晚会不一致。days 给一个大数，因为"我去过这家没有"
-    要看一辈子，不是看最近三十天。
+    散成两处早晚会不一致。不传 days：给了 place 就自动搜全库，
+    因为"我去过这家没有"要看一辈子，不是看最近三十天。
+
+    这里丢掉总数是刻意的：调用方（_been_there / history_note）拿它拼
+    "你去过N次"，而一家店去过六十次以上还要精确计数，那个需求不存在。
 
     匹配不上就返回空，调用方必须如实说"没有记录"，不许猜（文档 7.4）。
     """
     if not (place or "").strip():
         return []
-    return find_logs(place=place, days=3650)
+    rows, _ = find_logs(place=place)
+    return rows
 
 
 def active_memories() -> list[sqlite3.Row]:

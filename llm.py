@@ -272,7 +272,15 @@ TOOLS = [
                             "查出来条数少得可疑就别下结论，去掉 keyword 用 kind 或 category 重查一次。"
                         ),
                     },
-                    "days": {"type": "integer", "description": "往前看几天，默认 30。问'最近'用这个。注意它只是下界，将来的事一直都在结果里"},
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "往前看几天。**通常不用填** —— 给了 keyword 或 place 时"
+                            "系统自动搜全部历史，没给时自动看最近 30 天。"
+                            "只有用户明确说了「最近三天」这种范围才填。"
+                            "注意它只是下界，将来的事一直都在结果里。"
+                        ),
+                    },
                     "since": {
                         "type": "string",
                         "description": (
@@ -414,11 +422,21 @@ TOOLS = [
 ]
 
 
-def _run_tool(name: str, args: dict) -> str:
-    """执行工具，返回给模型看的文本结果。"""
+def _run_tool(name: str, args: dict, seen: dict[str, int] | None = None) -> str:
+    """执行工具。seen 是**回合作用域**的去重表，见 chat() 里的注释。"""
+    seen = seen if seen is not None else {}
+
     if name == "log_event":
         if err := _to_utc(args, "ts"):
             return err
+        # 回合内去重：这一轮刚查到过同名的记录，就别再记一条。
+        # 实测两次同一个模式 —— 模型 find_logs 看见了 id=38「看车展」，
+        # 下一圈还是 log_event 又写了一条。它越常被问起的事，越容易记重，
+        # 而重复记录会污染后面所有的统计（"我跟老王出去过几次"会多算）。
+        if (dup := seen.get((args.get("name") or "").strip())) is not None:
+            return (f"你这一轮刚查到过 id={dup}「{args['name']}」，别再记一条重复的。"
+                    f"要改它就用 correct_log；确实是另一件同名的事，"
+                    f"就把名字写具体一点再记。")
         try:
             row_id = db.log_event(args.get("category"), args.get("kind"), args["name"],
                                   note=args.get("note"), ts=args.get("ts"),
@@ -432,14 +450,27 @@ def _run_tool(name: str, args: dict) -> str:
     if name == "find_logs":
         if err := _to_utc(args, "since", "until"):
             return err
-        rows = db.find_logs(kind=args.get("kind"), keyword=args.get("keyword"),
-                            days=args.get("days", 30),
-                            since=args.get("since"), until=args.get("until"),
-                            category=args.get("category"), place=args.get("place"),
-                            status=args.get("status"))
+        # days 不传就交给 db.find_logs 去定：有关键词搜全库，没关键词最近 30 天。
+        # 这里绝不能写 args.get("days", 30) —— 那个 30 会把默认值规则顶掉。
+        rows, total = db.find_logs(
+            kind=args.get("kind"), keyword=args.get("keyword"),
+            days=args.get("days"),
+            since=args.get("since"), until=args.get("until"),
+            category=args.get("category"), place=args.get("place"),
+            status=args.get("status"))
         if not rows:
             return "没找到符合条件的记录。"
-        return "\n".join(_fmt_log(r) for r in rows)
+        # 登记进回合作用域的去重表，供本轮后面的 log_event 用
+        for r in rows:
+            if r["name"]:
+                seen.setdefault(r["name"].strip(), r["id"])
+        out = "\n".join(_fmt_log(r) for r in rows)
+        if total > len(rows):
+            # 截断了就必须说。不说的话模型会拿这批当全部去下结论 ——
+            # 那是"把有的说成没有"的另一种长相。
+            out += (f"\n（符合条件的共 {total} 条，上面是最近 {len(rows)} 条。"
+                    f"要看更早的就把关键词收窄，或者用 since/until 指定时段。）")
+        return out
 
     if name == "correct_log":
         row_id = args["id"]
@@ -700,7 +731,19 @@ def system_prompt() -> str:
 # ---------- 主循环 ----------
 
 def chat(messages: list[dict], verbose: bool = True) -> str:
-    """跑一轮对话（含工具调用），返回模型最终说的话。messages 会被就地更新。"""
+    """跑一轮对话（含工具调用），返回模型最终说的话。messages 会被就地更新。
+
+    ⚠️ seen 是**回合作用域**的去重表：{记录名: id}。
+
+    一个「回合」= 用户说一句话 → 模型可能连着绕好几圈工具 → 最后回一句话，
+    也就是下面这个 for 循环的整个生命周期。seen 是这个函数的局部变量，
+    循环一结束就跟着销毁 —— 所以下一回合用户再提同一件事，照常记得下来。
+
+    为什么作用域必须是回合，不能是"同名同日就拦"：同一天吃两次牛肉面是
+    合法的，按名字加日期硬拦会误伤。而"你这一轮刚查到过它，还要再记一遍"
+    这个信号是精确的，不会误判。
+    """
+    seen: dict[str, int] = {}
     for _ in range(MAX_ROUNDS):
         resp = _client().chat.completions.create(
             model=config.MODEL, messages=messages, tools=TOOLS,
@@ -747,7 +790,7 @@ def chat(messages: list[dict], verbose: bool = True) -> str:
             # 就是"模型到底填了什么"。
             if verbose:
                 print(f"  · {tc.function.name}({', '.join(f'{k}={v}' for k, v in args.items())})")
-            result = _run_tool(tc.function.name, args)
+            result = _run_tool(tc.function.name, args, seen)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     return "（工具调用绕了太多轮，我先停下了。）"
