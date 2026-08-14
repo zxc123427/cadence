@@ -26,7 +26,7 @@ import ui
 
 def fmt(r) -> str:
     """一行一条。跟 llm.py 的 _fmt_log 保持一致，只是这边带 id 更靠前。"""
-    line = (f"  [{r['id']:>3}]  {db.to_local(r['ts'])}  "
+    line = (f"  [{r['id']:>3}]  {db.when(r)}  "
             f"{r['category']}/{r['kind']}  {r['name']}")
     if r["place"]:
         line += f"  @{r['place']}"

@@ -19,8 +19,8 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "cadence.db"
 
-# 起步三张表。conversations（对话摘要）和 nudges（主动发言）等到真需要时再加，
-# 见设计文档 5.5 和 6.2 —— 但它们都会放在这同一个库里。
+# 四张表。conversations（对话摘要）等到真需要时再加，见设计文档 5.5 ——
+# 但它也会放在这同一个库里。
 SCHEMA = """
 -- 所有事件的流水账。出问题时唯一能查的东西。
 -- 字段对应设计文档 2.5 的统一内部消息格式。
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS logs (
     note       TEXT,
     place      TEXT,                    -- 在哪儿。店名、医院、城市都行，没有就为空
     status     TEXT NOT NULL DEFAULT 'done',      -- planned / done
+    ts_precision TEXT NOT NULL DEFAULT 'exact',   -- ts 这个时间有多准，见 TS_PRECISIONS
     extra      TEXT                     -- JSON 杂项
 );
 CREATE INDEX IF NOT EXISTS idx_logs_kind_ts ON logs(kind, ts);
@@ -59,6 +60,24 @@ CREATE TABLE IF NOT EXISTS memories (
     expires_at TEXT                     -- 可空。短期状态用，如"这个月在减脂"
 );
 CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key, created_at);
+
+-- 主动发言的提案与结果（设计文档 6.2）。
+-- **任何主动发言都不许直接播出去，必须先变成这里的一行。**
+-- 这样"它为什么提醒我"和"它为什么没提醒我"两个方向都查得出来 ——
+-- 后者才是难的：没发生的事不留痕，你就永远不知道闸门是不是拦错了。
+CREATE TABLE IF NOT EXISTS nudges (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL,          -- review / upcoming / ...
+    urgency     INTEGER NOT NULL DEFAULT 1,   -- 0 可有可无 / 1 普通 / 2 重要
+    payload     TEXT,                   -- 要说的话。**纯代码渲染好的**，不过模型
+    dedupe_key  TEXT NOT NULL UNIQUE,   -- 幂等靠它，见 propose_nudge 的注释
+    created_at  TEXT NOT NULL,
+    expires_ts  TEXT,                   -- 晚于此时间作废，不补播
+    fired_at    TEXT,                   -- 空 = 还没发
+    dropped_reason TEXT,                -- quiet_hours / cooldown / daily_budget / expired
+    outcome     TEXT                    -- ignored / acked / acted / muted
+);
+CREATE INDEX IF NOT EXISTS idx_nudges_kind_fired ON nudges(kind, fired_at);
 """
 
 
@@ -79,6 +98,31 @@ KINDS = ("meal", "study", "exercise", "travel", "health", "purchase", "other")
 
 # 事情做了没有。写入时由 _status_for() 从 ts 推出来，之后只有用户开口才改。
 STATUSES = ("planned", "done")
+
+# ts 这个时间有多准。
+#
+# 为什么要单开一列：**ts 一列同时装了两个答案** —— "什么时候发生"和
+# "这个时间有多准"。ts 是 NOT NULL，于是"周末跟家人聚餐"逼着模型瞎猜一个
+# 时间填进去，写成 planned，周一那天就变成"过期未确认"，助手会问你
+# "周末跟家人聚餐做了没" —— 可那件事的时间从来就没定过。
+#
+# 这跟当初 category / kind 拆两级是同一类问题（5.6）：动手前先问一句
+# "会不会有一件事同时属于两类"。会，就得拆。
+#
+# ⚠️ 拆法是 **ts 存区间的起点 + 精度另开一列**，不是"再开一列存模糊时间的原话"。
+# 存原话有两个致命问题：
+#   1. 不可比较。"周末"是个字符串，SQL 查不了"这周有哪些还没定死的事"
+#   2. 会失效。三周后那条记录还写着"下周"，但它指的是三周前的那个下周
+# 存起点两个问题都没有 —— 所有现成的区间查询和排序一行都不用改。
+TS_PRECISIONS = ("exact", "day", "week", "month")
+
+# 主动发言被闸门拦下来的原因（设计文档 6.3 的四条规则）。
+# 落库的是这几个固定值而不是自由文本 —— 一个月后要 GROUP BY 它来看
+# "到底是哪条规则在拦"，自由文本会拼出三种写法然后什么都统计不出来。
+DROP_REASONS = ("quiet_hours", "cooldown", "daily_budget", "expired")
+
+# 播报之后你的反应。这是全系统唯一一个"它做得对不对"的真实标签（6.4）。
+OUTCOMES = ("ignored", "acked", "acted", "muted")
 
 # ⚠️ 两级取值不许有交集。这是"category 和 kind 别填反"唯一可靠的防线 ——
 # 靠注释提醒不管用，靠值域不重叠，填反了校验当场就报错。
@@ -126,6 +170,44 @@ def to_local(ts: str) -> str:
     return dt.astimezone().strftime("%m-%d %H:%M")
 
 
+def local_day(ts: str | None = None) -> str:
+    """这个 UTC 时间戳落在本地的哪一天，如 "2026-08-14"。
+
+    ⚠️ **"今天"必须按本地日算，不能按 UTC 日。** 东八区的 08:00 之前
+    UTC 还停在昨天 —— 拿 ts[:10] 当日期用，每天早上八点前的判断全是错的，
+    而且不报错。每日预算和 dedupe_key 都踩在这个坑边上，所以只此一份。
+    """
+    dt = datetime.strptime(ts or now(), TS_FMT).replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d")
+
+
+def local_hm(ts: str | None = None) -> tuple[int, int]:
+    """这个 UTC 时间戳的本地时和分。闸门判静默时段用，理由同 local_day。"""
+    dt = datetime.strptime(ts or now(), TS_FMT).replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    return local.hour, local.minute
+
+
+def when(row) -> str:
+    """一条记录的时间，按 ts_precision 换措辞。**显示专用。**
+
+    存在的理由：ts 对没定死的事只是个区间起点。把"这周末跟家人聚餐"
+    显示成 "08-16 00:00" 是在撒谎 —— 那个 00:00 是代码填的，不是你说的，
+    可它看起来跟一个真约好的时间一模一样。
+
+    宁可显示得粗，也不能显示得比实际知道的更精确。
+    """
+    precision = row["ts_precision"] if "ts_precision" in row.keys() else "exact"
+    if precision == "exact":
+        return to_local(row["ts"])
+    dt = datetime.strptime(row["ts"], TS_FMT).replace(tzinfo=timezone.utc).astimezone()
+    if precision == "day":
+        return dt.strftime("%m-%d") + " 某时"
+    if precision == "week":
+        return dt.strftime("%m-%d") + " 那周"
+    return dt.strftime("%m 月")
+
+
 def from_local(s: str) -> str:
     """to_local 的逆：本地时间 "2026-08-10 15:00" -> UTC ISO。
 
@@ -155,6 +237,9 @@ NEW_COLUMNS = [
     ("logs", "place", "TEXT"),
     ("logs", "status", "TEXT NOT NULL DEFAULT 'done'"),
     ("logs", "category", "TEXT NOT NULL DEFAULT 'personal'"),
+    # 老行全部回填成 exact，这是对的：以前记的本来就都是具体时间。
+    # 个别不对的（当初被迫瞎猜的那种）用 correct_log 改。
+    ("logs", "ts_precision", "TEXT NOT NULL DEFAULT 'exact'"),
 ]
 
 
@@ -210,25 +295,32 @@ def _status_for(ts: str) -> str:
 
 
 def log_event(category: str, kind: str, name: str, note: str | None = None,
-              ts: str | None = None, place: str | None = None) -> int:
+              ts: str | None = None, place: str | None = None,
+              ts_precision: str = "exact") -> int:
     """记一件事。ts 不传就是现在（于是 status=done）。
 
     两级分类都走受控词表，非法值直接抛 ValueError —— 校验必须在 INSERT
     之前，否则会留下半条脏数据。
+
+    ts_precision 说的是"ts 这个时间有多准"：说好了周五九点是 exact，
+    只说"周末"是 week，这时 ts 填那个区间的**起点**（周六 00:00）。
+    见 TS_PRECISIONS 的注释。
     """
     category = _one_of(category, CATEGORIES, "category")
     kind = _one_of(kind, KINDS, "kind")
+    ts_precision = _one_of(ts_precision, TS_PRECISIONS, "ts_precision")
     ts = ts or now()
     status = _status_for(ts)
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO logs (category, kind, name, ts, created_at, note, place, status)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (category, kind, name, ts, now(), note, place, status),
+            "INSERT INTO logs (category, kind, name, ts, created_at, note, place,"
+            " status, ts_precision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (category, kind, name, ts, now(), note, place, status, ts_precision),
         )
     record_event("cli", "log_event", {
         "category": category, "kind": kind, "name": name,
         "note": note, "place": place, "ts": ts, "status": status,
+        "ts_precision": ts_precision,
     })
     return cur.lastrowid
 
@@ -241,7 +333,8 @@ def log_meal(name: str, note: str | None = None, ts: str | None = None,
 
 def correct_log(row_id: int, name: str | None = None, note: str | None = None,
                 ts: str | None = None, place: str | None = None,
-                category: str | None = None, status: str | None = None) -> bool:
+                category: str | None = None, status: str | None = None,
+                ts_precision: str | None = None) -> bool:
     """更正一条记录。id 不存在时返回 False。ts 传 UTC ISO。
 
     ⚠️ **改 ts 不会自动重算 status。** 用户说"那件事其实是上周做的"，
@@ -262,10 +355,12 @@ def correct_log(row_id: int, name: str | None = None, note: str | None = None,
         category = _one_of(category, CATEGORIES, "category")
     if status is not None:
         status = _one_of(status, STATUSES, "status")
+    if ts_precision is not None:
+        ts_precision = _one_of(ts_precision, TS_PRECISIONS, "ts_precision")
 
-    fields = ("name", "note", "ts", "place", "category", "status")
+    fields = ("name", "note", "ts", "place", "category", "status", "ts_precision")
     given = {"name": name, "note": note, "ts": ts, "place": place,
-             "category": category, "status": status}
+             "category": category, "status": status, "ts_precision": ts_precision}
 
     with connect() as conn:
         old = conn.execute("SELECT * FROM logs WHERE id = ?", (row_id,)).fetchone()
@@ -274,7 +369,7 @@ def correct_log(row_id: int, name: str | None = None, note: str | None = None,
         new = {f: (given[f] if given[f] is not None else old[f]) for f in fields}
         conn.execute(
             "UPDATE logs SET name = ?, note = ?, ts = ?, place = ?,"
-            " category = ?, status = ? WHERE id = ?",
+            " category = ?, status = ?, ts_precision = ? WHERE id = ?",
             (*(new[f] for f in fields), row_id))
 
     record_event("cli", "correct_log", {
@@ -282,6 +377,32 @@ def correct_log(row_id: int, name: str | None = None, note: str | None = None,
         "old": {f: old[f] for f in fields},
         "new": new,
     })
+    return True
+
+
+def append_note(row_id: int, text: str) -> bool:
+    """在已有备注后面接一段，**不覆盖**。id 不存在返回 False。
+
+    为什么不能用 correct_log 干这件事：那是**更正**，替换语义 ——
+    "我记错了，其实是周三" 就该把周二冲掉。而这里是**补充**：
+    review 时你说"那场球人挺多"，原来那句"老王叫的"没有错，不该消失。
+
+    一个工具装两种语义，模型只能靠语气猜该保留还是该覆盖，
+    而且猜错了不报错 —— 你要等到几个月后翻记录，才发现当初记的细节
+    被自己的一句评价洗掉了。所以分成两个函数，各自的语义写死在名字里。
+
+    ⚠️ 这个操作不进 ui.confirm：追加不毁数据，而确认框的意义是拦住
+    不可逆的动作（5.7）。每加一句评价都弹一次框，你很快就不肯用 review 了。
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT note FROM logs WHERE id = ?", (row_id,)).fetchone()
+        if row is None:
+            return False
+        old = (row["note"] or "").strip()
+        new = f"{old}；{text.strip()}" if old else text.strip()
+        conn.execute("UPDATE logs SET note = ? WHERE id = ?", (new, row_id))
+
+    record_event("cli", "append_note", {"id": row_id, "old": old, "new": new})
     return True
 
 
@@ -303,6 +424,9 @@ def delete_log(row_id: int) -> sqlite3.Row | None:
         "id": row_id, "category": row["category"], "kind": row["kind"],
         "name": row["name"], "note": row["note"], "ts": row["ts"],
         "place": row["place"], "status": row["status"],
+        # 这一条不能漏：events 是"删错了还能重插"的唯一依据，
+        # 少记一个字段，重插出来的就是另一条记录了
+        "ts_precision": row["ts_precision"],
     })
     return row
 
@@ -517,3 +641,176 @@ def memory_history(key: str) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM memories WHERE key = ? ORDER BY created_at DESC", (key,)
         ).fetchall()
+
+
+# ---------- 窄接口：review 要的两批数据 ----------
+
+def overdue_logs(ts: str | None = None) -> list[sqlite3.Row]:
+    """标了计划、时间已经过了、还没确认做没做的事。
+
+    这是 review 的主料。库里现在就躺着八条 —— 除非你自己想起来问，
+    否则它们永远不会被处理，这正是"没有主动性"的具体代价。
+
+    ⚠️ **只要 ts_precision='exact'。** "周末跟家人聚餐"那种 ts 是瞎填的
+    区间起点，周一就会显示成"过期未确认"，可那件事的时间从来没定过 ——
+    拿它去问"做了没"是纯误报。没定死时间的事归 review 的另一种形态管
+    （weekly / monthly，见文档 6.5），不归这里。
+    """
+    ts = ts or now()
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM logs WHERE status = 'planned' AND ts < ?"
+            " AND ts_precision = 'exact' ORDER BY ts DESC",
+            (ts,),
+        ).fetchall()
+
+
+def upcoming_logs(days: int = 1, ts: str | None = None) -> list[sqlite3.Row]:
+    """从现在到 days 天后，还没做的事。review 顺带报一句"明天有什么"。
+
+    这里**不限 ts_precision** —— 跟 overdue_logs 相反，是刻意的：
+    "这周末大概要跟家人聚餐"提前说一句是有用的，说错了代价也只是一句废话；
+    而拿它去问"做了没"是在逼你回答一个没有答案的问题。
+    同一列在两个方向上的容错度本来就不一样。
+    """
+    ts = ts or now()
+    end = (datetime.strptime(ts, TS_FMT) + timedelta(days=days)).strftime(TS_FMT)
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM logs WHERE status = 'planned' AND ts >= ? AND ts <= ?"
+            " ORDER BY ts",
+            (ts, end),
+        ).fetchall()
+
+
+def kind_counts() -> dict[str, int]:
+    """每个 kind 在库里有多少条。review 拿它当排序权重。
+
+    这是"这件事值不值得问一句"的全部实现 —— 天天干的事（吃饭、健身）
+    条数多，半年一次的事（考试、独自出游）条数少，越少越该问。
+
+    为什么是排序权重而不是二元判断：**排错序只是顺序不理想，判错了是漏报。**
+    而且它自适应 —— 你的习惯变了，频次自动跟着变，不像写死在行里的评分。
+    """
+    with connect() as conn:
+        return {r["kind"]: r["n"] for r in conn.execute(
+            "SELECT kind, count(*) AS n FROM logs GROUP BY kind")}
+
+
+def total_logs() -> int:
+    """库里一共多少条。review 用它判断频次信号够不够可信（冷启动门槛）。"""
+    with connect() as conn:
+        return conn.execute("SELECT count(*) FROM logs").fetchone()[0]
+
+
+# ---------- 窄接口：nudges ----------
+
+def propose_nudge(kind: str, payload: str, dedupe_key: str,
+                  urgency: int = 1, expires_ts: str | None = None) -> int | None:
+    """登记一条主动发言的提案。**已经有同 dedupe_key 的就什么都不做，返回 None。**
+
+    ⚠️ 幂等交给数据库的 UNIQUE 约束，不在 Python 里先查后插 ——
+    那中间有竞态，而且以后加了定时器就是两个进程在写同一张表。
+    `INSERT OR IGNORE` 是一句话的事，先查后插是一个将来才会炸的 bug。
+
+    dedupe_key 的形状：`review:daily:2026-08-14`（**本地**日期，见 local_day）。
+    设计文档 6.2 的 schema 里没有这一列，是实现时发现的缺口 ——
+    场景规则会被反复调用（你一晚上开三次 chat.py），没有它同一件事会入库三条。
+    """
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO nudges (kind, urgency, payload, dedupe_key,"
+            " created_at, expires_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (kind, urgency, payload, dedupe_key, now(), expires_ts),
+        )
+        if cur.rowcount == 0:        # 撞了 dedupe_key，这次不算新提案
+            return None
+    record_event("cli", "nudge_proposed",
+                 {"kind": kind, "dedupe_key": dedupe_key, "urgency": urgency})
+    return cur.lastrowid
+
+
+def pending_nudges() -> list[sqlite3.Row]:
+    """还没发也没被丢弃的提案，急的在前。"""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM nudges WHERE fired_at IS NULL AND dropped_reason IS NULL"
+            " ORDER BY urgency DESC, created_at",
+        ).fetchall()
+
+
+def fire_nudge(nudge_id: int, ts: str | None = None) -> None:
+    """标记这条已经播出去了。outcome 先留空，等你的反应。
+
+    ts 可传，理由跟 gate 那边一样：不给这个参数，自检就没法构造
+    "跨了 UTC 日但没跨本地日"这种场景，而那正是最容易错的地方。
+    """
+    with connect() as conn:
+        conn.execute("UPDATE nudges SET fired_at = ? WHERE id = ?",
+                     (ts or now(), nudge_id))
+    record_event("cli", "nudge_fired", {"id": nudge_id})
+
+
+def drop_nudge(nudge_id: int, reason: str) -> None:
+    """闸门拦下来了。**被拦的原因必须落库** —— 见 nudges 表的注释：
+    "它为什么没提醒我"才是难查的那个方向。"""
+    reason = _one_of(reason, DROP_REASONS, "dropped_reason")
+    with connect() as conn:
+        conn.execute("UPDATE nudges SET dropped_reason = ? WHERE id = ?",
+                     (reason, nudge_id))
+    record_event("cli", "nudge_dropped", {"id": nudge_id, "reason": reason})
+
+
+def set_outcome(nudge_id: int, outcome: str) -> bool:
+    """回写你的反应。id 不存在返回 False。
+
+    这是全系统唯一一个"它做得对不对"的真实标签（6.4）。跑一个月后
+    SELECT kind, outcome, count(*) FROM nudges GROUP BY 1,2 会直接
+    告诉你哪些场景该砍，比任何主观感受都准。
+    """
+    outcome = _one_of(outcome, OUTCOMES, "outcome")
+    with connect() as conn:
+        cur = conn.execute("UPDATE nudges SET outcome = ? WHERE id = ?",
+                           (outcome, nudge_id))
+        if cur.rowcount == 0:
+            return False
+    record_event("cli", "nudge_outcome", {"id": nudge_id, "outcome": outcome})
+    return True
+
+
+def fired_on(day: str, ts: str | None = None) -> list[sqlite3.Row]:
+    """某个**本地日**发出去的全部 nudge。每日预算靠它数数。
+
+    ⚠️ 不能写成 `WHERE fired_at LIKE '2026-08-14%'` —— fired_at 是 UTC，
+    东八区早上八点之前 UTC 还停在昨天，那样数出来的"今天"每天早上都是错的，
+    而且不报错。所以取出来在 Python 里用 local_day 逐条判。
+    数量级是每天几条，这点开销无所谓。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM nudges WHERE fired_at IS NOT NULL ORDER BY fired_at"
+        ).fetchall()
+    return [r for r in rows if local_day(r["fired_at"]) == day]
+
+
+def last_fired(kind: str) -> str | None:
+    """这个 kind 上一次发出去是什么时候（UTC）。同类冷却靠它。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT fired_at FROM nudges WHERE kind = ? AND fired_at IS NOT NULL"
+            " ORDER BY fired_at DESC LIMIT 1", (kind,)).fetchone()
+    return row["fired_at"] if row else None
+
+
+def recent_nudges(days: int = 7) -> list[sqlite3.Row]:
+    """最近的提案，新的在前。nudges.py 拿它给你看"它本来会说什么"。"""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM nudges WHERE created_at >= ? ORDER BY created_at DESC",
+            (days_ago(days),)).fetchall()
+
+
+def get_nudge(nudge_id: int) -> sqlite3.Row | None:
+    with connect() as conn:
+        return conn.execute("SELECT * FROM nudges WHERE id = ?",
+                            (nudge_id,)).fetchone()

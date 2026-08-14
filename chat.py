@@ -13,6 +13,7 @@
 import config
 import db
 import llm
+import review
 
 
 def main() -> None:
@@ -25,6 +26,17 @@ def main() -> None:
     print(f"cadence（{config.MODEL}）· 已知 {n} 条关于你的事 · Ctrl-C 退出\n")
 
     messages = [{"role": "system", "content": llm.system_prompt()}]
+
+    # 它先开口 —— cadence 的第一个主动场景（设计文档 6）。
+    # 晚上 21:30–23:30 之间开对话才会有，其余时候这里什么都不发生。
+    #
+    # ⚠️ 这段话是 review.py 纯代码渲染的，**不过模型**。
+    # 用 assistant 角色塞回历史，是因为那确实是助手说的话 —— 对话历史
+    # 得是真的，模型才知道"我刚说过这些"，你回一句"第 12 条做了"
+    # 它才接得上去 correct_log。
+    if (opening := review.tonight()) is not None:
+        print(f"cadence > {opening}\n")
+        messages.append({"role": "assistant", "content": opening})
 
     while True:
         try:

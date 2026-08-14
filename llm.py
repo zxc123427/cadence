@@ -62,7 +62,9 @@ def _status_tag(r) -> str:
 
 
 def _fmt_log(r) -> str:
-    return (f"id={r['id']}  {db.to_local(r['ts'])}  {r['category']}/{r['kind']}"
+    # db.when 而不是 db.to_local：没定死时间的事，ts 只是个区间起点，
+    # 照原样打出来会显示成一个看起来很确定的钟点（见 db.when）
+    return (f"id={r['id']}  {db.when(r)}  {r['category']}/{r['kind']}"
             f"  {r['name']}"
             + (f" @{r['place']}" if r["place"] else "")
             + (f"（{r['note']}）" if r["note"] else "")
@@ -227,6 +229,19 @@ TOOLS = [
                             "上午 09:00 / 中午 12:00 / 下午 15:00 / 晚上 19:00。"
                         ),
                     },
+                    "ts_precision": {
+                        "type": "string",
+                        "enum": list(db.TS_PRECISIONS),
+                        "description": (
+                            "ts 这个时间有多准，不填就是 exact。"
+                            "说定了几点几分是 exact；只说了哪一天（明天、周三）是 day；"
+                            "只说了大概哪一周（这周末、下周）是 week；"
+                            "只说了个月份或者「过段时间」是 month。"
+                            "**不是 exact 的时候，ts 填那个范围的开头**："
+                            "「这周末」填周六 00:00，「下个月」填一号 00:00。"
+                            "填对这一项很重要：只有 exact 的事以后才会被追问「做了没」。"
+                        ),
+                    },
                 },
                 # ts 刻意不设 required：设了就等于逼模型给每顿饭编一个时间。
                 "required": ["category", "kind", "name"],
@@ -330,8 +345,40 @@ TOOLS = [
                         "enum": list(db.STATUSES),
                         "description": "改成的新状态。用户说「那个我做了」就填 done。不改就不填",
                     },
+                    "ts_precision": {
+                        "type": "string",
+                        "enum": list(db.TS_PRECISIONS),
+                        "description": (
+                            "改成的新时间精度。用户说「那个还没定死时间」就往回改成"
+                            " day/week/month；说「定在周五三点了」就改成 exact"
+                            "（这时 ts 也要一起填）。不改就不填"
+                        ),
+                    },
                 },
                 "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_note",
+            "description": (
+                "给一条已有记录**补**一句备注，接在原来那句后面，不会覆盖。"
+                "用户回顾一件事、给评价、补细节时用它（「那场球人挺多」「那家店太吵了」）。"
+                "⚠️ 跟 correct_log 分工很清楚："
+                "用户说记的**不对**（记错时间、记错名字）才用 correct_log；"
+                "用户只是在**说这件事怎么样**，一律用 add_note —— "
+                "原来那句备注没有错，不该被评价洗掉。"
+                "如果同时还要改状态（「那个做了」），就再调一次 correct_log 改 status。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "记录 id，来自 find_logs 或开头那段总结"},
+                    "text": {"type": "string", "description": "要补上的这句话，用用户自己的说法"},
+                },
+                "required": ["id", "text"],
             },
         },
     },
@@ -440,7 +487,8 @@ def _run_tool(name: str, args: dict, seen: dict[str, int] | None = None) -> str:
         try:
             row_id = db.log_event(args.get("category"), args.get("kind"), args["name"],
                                   note=args.get("note"), ts=args.get("ts"),
-                                  place=args.get("place"))
+                                  place=args.get("place"),
+                                  ts_precision=args.get("ts_precision") or "exact")
         except ValueError as e:
             return _bad_vocab(e, args)
         # 回显必须带时间和状态。模型能自己填 ts 了，它就会把"昨天下午"记成
@@ -472,6 +520,11 @@ def _run_tool(name: str, args: dict, seen: dict[str, int] | None = None) -> str:
                     f"要看更早的就把关键词收窄，或者用 since/until 指定时段。）")
         return out
 
+    if name == "add_note":
+        if not db.append_note(args["id"], args["text"]):
+            return f"没有 id={args['id']} 这条记录，先用 find_logs 确认 id。"
+        return f"已补上：{_fmt_log(db.get_log(args['id']))}"
+
     if name == "correct_log":
         row_id = args["id"]
         old = db.get_log(row_id)
@@ -486,13 +539,13 @@ def _run_tool(name: str, args: dict, seen: dict[str, int] | None = None) -> str:
         # 写成了空串 —— 一个没经过确认的字段被改掉了（README 已知问题）。
         # 空串本身也挡掉："清空"该是显式操作，不该是省略参数的副作用。
         edits = {k: args[k] for k in ("name", "note", "ts", "place",
-                                      "category", "status")
+                                      "category", "status", "ts_precision")
                  if args.get(k) is not None}
         if any(v == "" for v in edits.values()):
             return "不接受空字符串。要清空某个字段就明说，别传空串。"
 
         labels = {"name": "名称", "note": "备注", "ts": "时间", "place": "地点",
-                  "category": "大分类", "status": "状态"}
+                  "category": "大分类", "status": "状态", "ts_precision": "时间精度"}
         changes = [
             # 确认框里说的是本地时间 —— 给人看的东西不该出现 UTC
             f"{labels[k]}改成「{db.to_local(v) if k == 'ts' else v}」"
@@ -716,6 +769,12 @@ def system_prompt() -> str:
         "查不到的信息就说没查到，绝不编。编一家不存在的餐厅比不回答糟糕得多。",
         "每条用户消息开头方括号里的是系统加的当前时间，不是用户说的内容，别复述它。"
         "所有工具的时间参数都填本地时间，格式 2026-08-10 15:00。",
+        "用户说的时间没定死（「这周末」「过段时间」「下个月」），"
+        "log_event 的 ts 就填那个范围的开头，同时把 ts_precision 填成 week / month —— "
+        "**别自己编一个具体钟点**。编了的话以后它会被当成一个真约好的时间来追问你「做了没」。",
+        "开头那段总结是系统按库里的记录直接列出来的，不是你说的。"
+        "用户回一句「第几条做了」，就用 correct_log 把那条 status 改成 done；"
+        "他顺口给的评价用 add_note 补上去，**别拿评价去覆盖原来的备注**。",
     ]
     # 注意：这里刻意不拼当前时间。system prompt 在 messages 最前面，
     # 它每轮一变，整段对话历史的 prompt 缓存就全部失配。时间走

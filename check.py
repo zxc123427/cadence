@@ -65,7 +65,7 @@ def raises(label: str, fn, *args, **kwargs) -> None:
     ok(label, False, "没抛异常")
 
 
-def columns(path: Path) -> dict:
+def columns(path: Path, table: str = "logs") -> dict:
     """PRAGMA table_info 转成 {列名: (类型, 非空, 默认值)}。
 
     用字典而不是列表：新建库里 category 是第 2 列，升级库里它排在最后 ——
@@ -73,7 +73,8 @@ def columns(path: Path) -> dict:
     """
     conn = sqlite3.connect(path)
     try:
-        return {r[1]: (r[2], r[3], r[4]) for r in conn.execute("PRAGMA table_info(logs)")}
+        return {r[1]: (r[2], r[3], r[4])
+                for r in conn.execute(f"PRAGMA table_info({table})")}
     finally:
         conn.close()
 
@@ -123,6 +124,8 @@ ok("老数据逐字段没被改动", same)
 
 ok("老行的 status 回填成 done", all(r["status"] == "done" for r in after))
 ok("老行的 category 回填成 personal", all(r["category"] == "personal" for r in after))
+# 回填成 exact 是对的：ts_precision 这一列出现之前记的，本来就都是具体时间
+ok("老行的 ts_precision 回填成 exact", all(r["ts_precision"] == "exact" for r in after))
 
 cols_migrated = columns(db.DB_PATH)
 db.connect().close()                                        # 再跑一次
@@ -133,10 +136,19 @@ ok("连跑两次数据不变", db.find_logs(days=3650)[1] == 3)
 # SCHEMA 和 NEW_COLUMNS 是两处写法，漂了就会出现"新装的机器和老机器不一样"，
 # 而这种差异要等到你换电脑那天才暴露。
 migrated_path = db.DB_PATH
+nudges_migrated = columns(db.DB_PATH, "nudges")
 db.DB_PATH = migrated_path.parent / "brandnew.db"
 db.connect().close()
 ok("新建库和升级库的表结构完全一致", columns(db.DB_PATH) == cols_migrated,
    f"新建 {columns(db.DB_PATH)}\n  升级 {cols_migrated}")
+# nudges 是这一轮新加的表。老库里它由 CREATE TABLE IF NOT EXISTS 建出来，
+# 走的跟新库同一条路 —— 但还是要比一次，否则哪天有人给它加列走了 NEW_COLUMNS，
+# 两条路就会静静地漂开。
+ok("nudges 表在新建库和升级库里也一致",
+   columns(db.DB_PATH, "nudges") == nudges_migrated)
+# index_list 每行是 (seq, name, unique, origin, partial)，第 3 个才是唯一性
+ok("nudges.dedupe_key 建了唯一约束", any(
+    r[2] == 1 for r in sqlite3.connect(db.DB_PATH).execute("PRAGMA index_list(nudges)")))
 db.DB_PATH = migrated_path
 
 
@@ -403,12 +415,229 @@ p = json.loads(ev["payload"])
 ok("correct_log 的 events 留痕带上了 status 新旧值",
    "status" in p["old"] and "status" in p["new"])
 
+# append_note vs correct_log 的分工：一个补一个换。
+# 搞混了不报错，只是几个月后你发现当初记的细节被自己一句评价洗掉了。
+nid = db.log_event("appointment", "exercise", "打羽毛球", note="老王叫的")
+db.append_note(nid, "人挺多的")
+ok("append_note 接在原备注后面，不覆盖",
+   db.get_log(nid)["note"] == "老王叫的；人挺多的", db.get_log(nid)["note"])
+with db.connect() as c:
+    p2 = json.loads(c.execute("SELECT payload FROM events WHERE type='append_note'"
+                              " ORDER BY id DESC LIMIT 1").fetchone()["payload"])
+ok("append_note 也留痕（旧值查得回来）", p2["old"] == "老王叫的")
+
+db.append_note(db.log_event("personal", "meal", "面"), "还行")
+ok("原来没备注时不留下多余的分隔符",
+   db.find_logs(keyword="面")[0][0]["note"] == "还行")
+ok("append_note 对不存在的 id 返回 False", db.append_note(99999, "x") is False)
+
+db.correct_log(nid, note="改成这句")
+ok("correct_log 仍然是覆盖语义", db.get_log(nid)["note"] == "改成这句")
+
 with db.connect() as c:
     bad = c.execute("SELECT count(*) FROM logs WHERE category NOT IN (?,?)"
                     " OR kind NOT IN (?,?,?,?,?,?,?)"
                     " OR status NOT IN (?,?)",
                     (*db.CATEGORIES, *db.KINDS, *db.STATUSES)).fetchone()[0]
 ok("库里没有任何越界的分类值", bad == 0)
+
+
+# ---------- 7. 主动性：闸门与 review ----------
+#
+# 这一节的断言全部走 ts 参数，不碰系统时钟。所有时刻都用 db.from_local
+# 从本地时间换算过去 —— 这样断言在任何时区下都成立，而且**在非 UTC 时区下
+# 才真正有威慑力**：把 local_day 写成 ts[:10] 的话，下面第一条当场就红。
+
+print("\n主动性：闸门")
+
+import gate                                                  # noqa: E402
+import review                                                # noqa: E402
+
+fresh_db()
+
+D = "2026-08-14"
+
+
+def at(hm: str) -> str:
+    """本地时间 "2026-08-14 22:00" -> UTC ISO。"""
+    return db.from_local(f"{D} {hm}")
+
+
+def planned(category: str, kind: str, name: str, ts: str,
+            ts_precision: str = "exact") -> int:
+    """记一条**计划中**的事。
+
+    不能只靠 log_event —— 它的 status 是拿 ts 跟**真实的现在**比出来的
+    （db._status_for），而这一节用的是 2026-08-14 这个固定日期，
+    跑自检的那天一过它就全变成 done 了，断言会莫名其妙地红。
+    所以显式改回 planned，让这一节的结果跟今天几号无关。
+    """
+    row_id = db.log_event(category, kind, name, ts=ts, ts_precision=ts_precision)
+    db.correct_log(row_id, status="planned")
+    return row_id
+
+
+# --- 本地日 vs UTC 日 ---
+# 这两条是整节的地基。东八区本地 07:30 时 UTC 还停在前一天，
+# 西半球本地 22:00 时 UTC 已经是第二天 —— 两边各错一头，
+# 而 ts[:10] 这种写法在两边都会静静地给出错误答案。
+ok("本地清晨算当天（UTC 可能还在昨天）", db.local_day(at("07:30")) == D)
+ok("本地深夜算当天（UTC 可能已到明天）", db.local_day(at("22:00")) == D)
+
+# --- 静默时段 ---
+ok("23:35 在静默时段内", gate.in_quiet_hours(at("23:35")))
+ok("06:00 在静默时段内", gate.in_quiet_hours(at("06:00")))
+ok("中午不在静默时段", not gate.in_quiet_hours(at("12:00")))
+ok("23:29 还没进静默时段", not gate.in_quiet_hours(at("23:29")))
+
+# --- dedupe_key 幂等 ---
+first = db.propose_nudge("review", "第一次", dedupe_key="k1")
+again = db.propose_nudge("review", "第二次", dedupe_key="k1")
+ok("同 dedupe_key 重复提案返回 None", again is None)
+ok("同 dedupe_key 不产生第二行", len(db.pending_nudges()) == 1)
+ok("重复提案没有覆盖已有内容", db.get_nudge(first)["payload"] == "第一次")
+
+# --- 闸门四条 ---
+n = db.get_nudge(first)
+ok("静默时段拦住", gate.check(n, at("23:40")) == (False, "quiet_hours"))
+ok("窗口内放行", gate.check(n, at("22:00")) == (True, None))
+
+expiring = db.get_nudge(db.propose_nudge(
+    "other", "过期的", dedupe_key="k2", expires_ts=at("20:00")))
+ok("过期的先于静默时段被判掉",
+   gate.check(expiring, at("23:40")) == (False, "expired"))
+
+# 同类冷却：review 的冷却是 20 小时
+db.fire_nudge(first, at("22:00"))
+n2 = db.get_nudge(db.propose_nudge("review", "同一类的下一条", dedupe_key="k3"))
+ok("同 kind 冷却期内被拦",
+   gate.check(n2, at("22:30")) == (False, "cooldown"))
+ok("不同 kind 不受这条冷却影响",
+   gate.check(db.get_nudge(db.propose_nudge("other", "别的类", dedupe_key="k4")),
+              at("22:30")) == (True, None))
+
+# --- 每日预算按本地日 ---
+fresh_db()
+for i, hm in enumerate(("08:00", "12:00", "18:00")):
+    db.fire_nudge(db.propose_nudge(f"k{i}", "x", dedupe_key=f"d{i}"), at(hm))
+ok("同一本地日的三条都算进今天", len(db.fired_on(D)) == 3)
+ok("预算用完后第四条被拦",
+   gate.check(db.get_nudge(db.propose_nudge("k9", "x", dedupe_key="d9")),
+              at("21:00")) == (False, "daily_budget"))
+# 前一天发的不该占今天的额度
+ok("昨天发的不算今天",
+   len(db.fired_on(db.local_day(db.from_local(f"2026-08-13 12:00")))) == 0)
+
+# --- muted 的确定性后果 ---
+fresh_db()
+base = gate.cooldown_minutes("review")
+mid = db.propose_nudge("review", "x", dedupe_key="m1")
+db.fire_nudge(mid, at("22:00"))
+db.set_outcome(mid, "muted")
+ok("被 mute 一次冷却翻倍", gate.cooldown_minutes("review") == base * 2)
+for i in range(2):
+    other = db.propose_nudge("review", "x", dedupe_key=f"m{i + 2}")
+    db.fire_nudge(other, at("22:00"))
+    db.set_outcome(other, "muted")
+ok("被 mute 到上限直接停用", gate.cooldown_minutes("review") == float("inf"))
+ok("停用后一律拦下，原因记 cooldown",
+   gate.check(db.get_nudge(db.propose_nudge("review", "x", dedupe_key="m9")),
+              at("22:00")) == (False, "cooldown"))
+
+raises("dropped_reason 不认自造的值", db.drop_nudge, mid, "我不想发")
+raises("outcome 不认自造的值", db.set_outcome, mid, "还行吧")
+
+# --- gate.run 把被拦的原因落库 ---
+fresh_db()
+blocked = db.propose_nudge("review", "深夜这条", dedupe_key="r1")
+ok("静默时段 run 一条都不放行", gate.run(at("23:45")) == [])
+ok("被拦的原因写进了库", db.get_nudge(blocked)["dropped_reason"] == "quiet_hours")
+ok("被拦的不再出现在待发队列", db.pending_nudges() == [])
+
+
+print("\n主动性：review")
+
+fresh_db()
+
+# --- 播报窗口 ---
+ok("21:00 还没到播报窗口", not review.in_window(at("21:00")))
+ok("22:00 在播报窗口内", review.in_window(at("22:00")))
+ok("23:40 已经出了播报窗口", not review.in_window(at("23:40")))
+
+# --- 数据源：ts_precision 的分工 ---
+# 定死了时间的过期计划才该被追问"做了没"；
+# "这周末跟家人聚餐"那种 ts 是代码填的区间起点，拿它追问是纯误报。
+exact_id = planned("appointment", "study", "期末考试", at("09:00"), "exact")
+vague_id = planned("appointment", "meal", "跟家人聚餐", at("10:00"), "week")
+overdue = db.overdue_logs(at("22:00"))
+ok("过期未确认只收 exact 的", [r["id"] for r in overdue] == [exact_id])
+ok("没定死时间的不会被追问做了没",
+   vague_id not in [r["id"] for r in overdue])
+
+# 反过来，"明天有什么"要把没定死的也说出来 —— 说错了只是一句废话
+ahead = db.upcoming_logs(days=1, ts=at("22:00"))
+future = planned("personal", "travel", "大概去趟宣城",
+                 db.from_local("2026-08-15 10:00"), "day")
+ok("明天预告收没定死时间的",
+   future in [r["id"] for r in db.upcoming_logs(days=1, ts=at("22:00"))])
+ok("已经过去的不算明天的事", exact_id not in [r["id"] for r in ahead])
+
+# --- db.when 按精度换措辞 ---
+ok("exact 显示到分钟", ":" in db.when(db.get_log(exact_id)))
+ok("week 不显示钟点", "那周" in db.when(db.get_log(vague_id))
+   and ":" not in db.when(db.get_log(vague_id)))
+
+# --- 排序 ---
+fresh_db()
+ids = {
+    "约人吃饭": planned("appointment", "meal", "约人吃饭", at("08:00")),
+    "自己吃饭": planned("personal", "meal", "自己吃饭", at("09:00")),
+    "自己考试": planned("personal", "study", "自己考试", at("10:00")),
+}
+for _ in range(40):                       # 把 meal 灌成高频，同时越过冷启动门槛
+    db.log_event("personal", "meal", "又吃了一顿")
+rows = db.overdue_logs(at("22:00"))
+ranked = review.rank(rows, db.kind_counts(), db.total_logs())
+names = [r["name"] for r in ranked if r["name"] in ids]
+ok("有别人的排在最前", names[0] == "约人吃饭", f"实际顺序 {names}")
+ok("低频的排在高频前面", names.index("自己考试") < names.index("自己吃饭"),
+   f"实际顺序 {names}")
+
+# 冷启动：数据太少时什么都是"低频"，那个信号是噪音，不该参与排序
+few = review.rank(rows, {"meal": 100, "study": 1}, total=5)
+ok("库存不够时频次不参与排序",
+   [r["name"] for r in few if r["name"] in ids][:1] == ["约人吃饭"])
+
+# --- 渲染 ---
+ok("没话说就不播", review.render([], []) is None)
+
+for i in range(5):                         # 凑到超过 REVIEW_LIMIT 才测得到熔断
+    planned("personal", "other", f"待办{i}", at("07:00"))
+many = db.overdue_logs(at("22:00"))
+ok("测熔断的数据确实超了上限", len(many) > review.REVIEW_LIMIT)
+text = review.render(many, [])
+shown = sum(1 for ln in text.splitlines() if ln.strip().startswith("["))
+ok("一次最多摆 REVIEW_LIMIT 条", shown == review.REVIEW_LIMIT,
+   f"摆了 {shown} 条")
+# 截断不说等于"把有的说成没有"，跟 find_logs 上一轮踩的是同一个坑
+ok("截断了必须说还有多少条", f"还有 {len(many) - review.REVIEW_LIMIT} 条" in text)
+ok("每一行都带 id（不带的话你没法说「第几条做了」）",
+   all("[" in ln for ln in text.splitlines() if ln.strip().startswith("[")))
+
+# --- propose 幂等 ---
+fresh_db()
+planned("appointment", "study", "期末考试", at("09:00"))
+one = review.propose(at("22:00"))
+two = review.propose(at("22:30"))
+ok("同一晚开两次对话只生成一条提案", one is not None and two is None)
+ok("窗口外不生成提案", review.propose(at("20:00")) is None)
+
+# 今晚的提案在窗口结束时作废，绝不留到明早补播
+ok("提案的失效时间是今晚窗口结束",
+   db.get_nudge(one)["expires_ts"] == at("23:30"))
+
+fresh_db()
+ok("库里没有可说的事时不硬凑一条", review.propose(at("22:00")) is None)
 
 
 print(f"\n全过了（{passed} 条断言）。临时库：{db.DB_PATH.parent}")
