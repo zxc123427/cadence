@@ -264,6 +264,25 @@ def connect() -> sqlite3.Connection:
     """打开数据库，第一次会自动建表，老库自动补新列。"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row          # 让查询结果能用列名访问：row["name"]
+
+    # WAL：写的时候不动主文件，把新内容追加到 cadence.db-wal，读的人照常读主文件。
+    # 默认的 delete 模式是直接改主文件，于是**一个正在读的连接会挡住写**——
+    # 实测 delete 模式下，读者开着事务时写者提交直接 database is locked。
+    #
+    # 现在只有一个进程，用不上。加在这里是因为待办 F（计时器）和 A（后台归档）
+    # 都会引入第二个进程 —— 那时 propose_nudge 靠 UNIQUE 防竞态的思路才真正被考验。
+    #
+    # 这一句是**持久化**的：它写进 cadence.db 的文件头，设一次就永远是 WAL，
+    # 每次 connect 都跑只是图省事（幂等）。代价是库变成三个文件（.db / -wal / -shm），
+    # 备份要一起拷，单独拷 .db 会丢掉还没 checkpoint 的最近写入。
+    #
+    # ⚠️ 必须在 executescript 之前：PRAGMA journal_mode 在事务里执行会静默失败。
+    #
+    # 配套的 busy_timeout（撞锁后重试多久）不用设 —— Python 的 sqlite3.connect
+    # 有个 timeout=5.0 参数，默认就把它设成了 5000ms。实测 PRAGMA busy_timeout
+    # 返回 5000。写一句 PRAGMA busy_timeout=5000 是把 5000 设成 5000。
+    conn.execute("PRAGMA journal_mode=WAL")
+
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn

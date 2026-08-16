@@ -2,7 +2,7 @@
 .env
 
 # 私人数据，不进版本控制
-cadence.db
+cadence.db*
 
 # Python 的编译缓存
 __pycache__/
@@ -11,3 +11,7 @@ __pycache__/
 # 编辑器 / 系统
 .vscode/
 .DS_Store
+
+# 学习笔记与实验脚本（code-study skill 产的）。
+# 不进版本控制：这个 repo 以后要给人看，学习草稿不该混在项目历史里。
+learning/

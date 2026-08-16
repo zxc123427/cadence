@@ -80,8 +80,17 @@ def columns(path: Path, table: str = "logs") -> dict:
 
 
 def fresh_db() -> None:
-    """删掉临时库，让下一次 connect() 走新建路径。"""
-    db.DB_PATH.unlink(missing_ok=True)
+   """删掉临时库，让下一次 connect() 走新建路径。
+
+   ⚠️ **三个文件一起删。** 开了 WAL 之后库不再是单个文件（见 db.connect 的注释）——
+   只 unlink 主文件会留下一对孤儿 -wal / -shm，它们还指着那个已经被删掉的库，
+   下一次 connect() 直接 disk I/O error。
+
+   跟 .gitignore 要写 cadence.db* 是同一件事的两个面：一处是"提交时别漏掉那两个"，
+   一处是"删除时别漏掉那两个"。加 WAL 那天这两处都得改，漏一处就红在这里。
+   """
+   for suffix in ("", "-wal", "-shm"):
+       Path(str(db.DB_PATH) + suffix).unlink(missing_ok=True)
 
 
 def utc(delta: timedelta) -> str:
